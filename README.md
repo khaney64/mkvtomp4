@@ -6,7 +6,7 @@ A powerful PowerShell script for batch converting MKV video files to MP4 format 
 
 - 🎬 **Automatic Preset Selection** — Detects video resolution and applies appropriate HandBrake preset (480p or 1080p)
 - 📊 **Performance Tracking** — Learns from each conversion to provide accurate time estimates
-- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, and show modes for different workflows
+- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, show, and space modes for different workflows
 - 💾 **Disk Space Analysis** — Estimates required space and checks availability before conversion
 - 🛡️ **Safe Conversion** — Uses temporary files to prevent incomplete MP4s from interrupted processes
 - 🎯 **Idempotent** — Running multiple times only converts new files
@@ -97,6 +97,19 @@ Restores hidden files by renaming `.mk_` back to `.mkv`:
 .\Convert-MkvToMp4.ps1 -Mode show
 ```
 
+#### `space`
+Analyzes disk space usage for all media files:
+- Scans all subdirectories recursively
+- Reports space used by `.mp4`, `.mp_`, `.mkv`, and `.mk_` files
+- Shows file counts and sizes for each type
+- Displays grand total of all media files
+- Shows disk information (capacity, available space, usage percentage)
+
+```powershell
+.\Convert-MkvToMp4.ps1 -Mode space
+.\Convert-MkvToMp4.ps1 space "M:\Movies"
+```
+
 ## Conversion Settings
 
 The script uses the following HandBrake settings for high-quality, web-optimized output:
@@ -154,6 +167,15 @@ The script learns from each conversion:
 ### Find completed conversions
 ```powershell
 .\Convert-MkvToMp4.ps1 -Mode find
+```
+
+### Analyze disk space usage
+```powershell
+# Get detailed space usage report for all media files
+.\Convert-MkvToMp4.ps1 -Mode space
+
+# Analyze a specific directory
+.\Convert-MkvToMp4.ps1 space "D:\Media\Movies"
 ```
 
 ## Output Examples

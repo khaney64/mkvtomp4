@@ -8,7 +8,7 @@
     preset based on video resolution (480p or 1080p).
 
 .PARAMETER Mode
-    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), or "show" to rename .mk_ back to .mkv.
+    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), "show" to rename .mk_ back to .mkv, or "space" to analyze disk space usage of media files.
 
 .PARAMETER Path
     The directory path to scan. Defaults to the current directory if not specified.
@@ -23,7 +23,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("check", "convert", "find", "hide", "show")]
+    [ValidateSet("check", "convert", "find", "hide", "show", "space")]
     [string]$Mode = "check",
     
     [Parameter(Position = 1)]
@@ -346,6 +346,7 @@ $modeColor = switch ($Mode) {
     "find" { "Magenta" }
     "hide" { "Yellow" }
     "show" { "Yellow" }
+    "space" { "Blue" }
     default { "Cyan" }
 }
 Write-Host "Mode: $Mode" -ForegroundColor $modeColor
@@ -360,6 +361,117 @@ if (-not (Test-Path $Path)) {
 $currentDir = (Resolve-Path $Path).Path
 Write-Host "Scanning directory: $currentDir" -ForegroundColor Cyan
 Write-Host ""
+
+# Handle space mode - analyze disk usage of media files
+if ($Mode -eq "space") {
+    Write-Host "Scanning for media files..." -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Find all media files
+    $mp4Files = Get-ChildItem -Path $currentDir -Recurse -Filter "*.mp4" -File -ErrorAction SilentlyContinue
+    $mp_Files = Get-ChildItem -Path $currentDir -Recurse -Filter "*.mp_" -File -ErrorAction SilentlyContinue
+    $mkvFiles = Get-ChildItem -Path $currentDir -Recurse -Filter "*.mkv" -File -ErrorAction SilentlyContinue
+    $mk_Files = Get-ChildItem -Path $currentDir -Recurse -Filter "*.mk_" -File -ErrorAction SilentlyContinue
+    
+    # Calculate total sizes
+    $mp4Size = ($mp4Files | Measure-Object -Property Length -Sum).Sum
+    $mp_Size = ($mp_Files | Measure-Object -Property Length -Sum).Sum
+    $mkvSize = ($mkvFiles | Measure-Object -Property Length -Sum).Sum
+    $mk_Size = ($mk_Files | Measure-Object -Property Length -Sum).Sum
+    
+    # Handle null values for empty collections
+    if ($null -eq $mp4Size) { $mp4Size = 0 }
+    if ($null -eq $mp_Size) { $mp_Size = 0 }
+    if ($null -eq $mkvSize) { $mkvSize = 0 }
+    if ($null -eq $mk_Size) { $mk_Size = 0 }
+    
+    $grandTotal = $mp4Size + $mp_Size + $mkvSize + $mk_Size
+    
+    # Display results
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host "Space Usage Summary" -ForegroundColor Yellow
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host ""
+    
+    # MP4 files
+    $mp4GB = [math]::Round($mp4Size / 1GB, 2)
+    $mp4MB = [math]::Round($mp4Size / 1MB, 2)
+    Write-Host "MP4 files (.mp4):" -ForegroundColor White
+    Write-Host "  Count: $($mp4Files.Count)" -ForegroundColor Gray
+    if ($mp4GB -ge 1) {
+        Write-Host "  Size: $mp4GB GB ($mp4MB MB)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Size: $mp4MB MB" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    
+    # MP_ files (temp conversions)
+    $mp_GB = [math]::Round($mp_Size / 1GB, 2)
+    $mp_MB = [math]::Round($mp_Size / 1MB, 2)
+    Write-Host "Temporary files (.mp_):" -ForegroundColor White
+    Write-Host "  Count: $($mp_Files.Count)" -ForegroundColor Gray
+    if ($mp_GB -ge 1) {
+        Write-Host "  Size: $mp_GB GB ($mp_MB MB)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Size: $mp_MB MB" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    
+    # MKV files
+    $mkvGB = [math]::Round($mkvSize / 1GB, 2)
+    $mkvMB = [math]::Round($mkvSize / 1MB, 2)
+    Write-Host "MKV files (.mkv):" -ForegroundColor White
+    Write-Host "  Count: $($mkvFiles.Count)" -ForegroundColor Gray
+    if ($mkvGB -ge 1) {
+        Write-Host "  Size: $mkvGB GB ($mkvMB MB)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Size: $mkvMB MB" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    
+    # MK_ files (hidden)
+    $mk_GB = [math]::Round($mk_Size / 1GB, 2)
+    $mk_MB = [math]::Round($mk_Size / 1MB, 2)
+    Write-Host "Hidden files (.mk_):" -ForegroundColor White
+    Write-Host "  Count: $($mk_Files.Count)" -ForegroundColor Gray
+    if ($mk_GB -ge 1) {
+        Write-Host "  Size: $mk_GB GB ($mk_MB MB)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Size: $mk_MB MB" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    
+    # Grand total
+    Write-Host "==================================" -ForegroundColor Yellow
+    $grandTotalGB = [math]::Round($grandTotal / 1GB, 2)
+    $grandTotalMB = [math]::Round($grandTotal / 1MB, 2)
+    $totalFiles = $mp4Files.Count + $mp_Files.Count + $mkvFiles.Count + $mk_Files.Count
+    Write-Host "Grand Total:" -ForegroundColor White
+    Write-Host "  Total files: $totalFiles" -ForegroundColor Gray
+    if ($grandTotalGB -ge 1) {
+        Write-Host "  Total size: $grandTotalGB GB ($grandTotalMB MB)" -ForegroundColor Green
+    } else {
+        Write-Host "  Total size: $grandTotalMB MB" -ForegroundColor Green
+    }
+    Write-Host ""
+    
+    # Available disk space
+    $drive = Split-Path -Qualifier $currentDir
+    if ($drive) {
+        $diskInfo = Get-PSDrive -Name $drive.TrimEnd(':') -ErrorAction SilentlyContinue
+        if ($diskInfo) {
+            $freeSpaceGB = [math]::Round($diskInfo.Free / 1GB, 2)
+            $totalSpaceGB = [math]::Round(($diskInfo.Free + $diskInfo.Used) / 1GB, 2)
+            $usedPercent = [math]::Round(($diskInfo.Used / ($diskInfo.Free + $diskInfo.Used)) * 100, 1)
+            Write-Host "Disk Information (${drive}):" -ForegroundColor White
+            Write-Host "  Total capacity: $totalSpaceGB GB" -ForegroundColor Gray
+            Write-Host "  Available space: $freeSpaceGB GB" -ForegroundColor Gray
+            Write-Host "  Used: $usedPercent%" -ForegroundColor Gray
+        }
+    }
+    Write-Host ""
+    exit 0
+}
 
 # Handle hide mode - rename .mkv to .mk_
 if ($Mode -eq "hide") {

@@ -11,7 +11,7 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 1. **Mode** (Position 0, Optional)
    - Type: String
    - Default: `"check"`
-   - Valid values: `"check"`, `"convert"`, `"find"`, `"hide"`, `"show"`
+   - Valid values: `"check"`, `"convert"`, `"find"`, `"hide"`, `"show"`, `"space"`
    - Description: Determines the operation to perform
 
 2. **Path** (Position 1, Optional)
@@ -106,6 +106,30 @@ Create a PowerShell script that automates the conversion of MKV video files to M
    - Rename file (keeps same directory)
    - Log success or failure
 4. Display summary: total found, total restored
+
+#### Mode: "space"
+
+1. Find all media files recursively in Path:
+   - `.mp4` files (converted videos)
+   - `.mp_` files (temporary conversion files)
+   - `.mkv` files (source videos)
+   - `.mk_` files (hidden source videos)
+2. Calculate total size for each file type using `Measure-Object -Property Length -Sum`
+3. Handle null values for empty collections (set to 0)
+4. Calculate grand total of all file sizes
+5. Display formatted summary:
+   - For each file type:
+     - Display file type name
+     - Display count of files
+     - Display size in GB (if >= 1 GB) or MB
+   - Display grand total:
+     - Total file count (all types combined)
+     - Total size in GB (if >= 1 GB) or MB
+   - Display disk information:
+     - Total disk capacity in GB
+     - Available space in GB
+     - Usage percentage
+6. Exit with code 0
 
 #### Mode: "find"
 
@@ -350,7 +374,8 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 2. **Target files**: Use `.mp4` extension with same base name as source
 3. **Temporary conversion files**: Use `.mp_` extension during encoding
 4. **Hidden files**: Use `.mk_` extension when hiding from Plex
-5. **File paths**: Must handle spaces correctly (quote paths in HandBrake arguments)
+5. **Media file types scanned in space mode**: `.mp4`, `.mp_`, `.mkv`, `.mk_`
+6. **File paths**: Must handle spaces correctly (quote paths in HandBrake arguments)
 
 ### Conversion Settings
 
@@ -388,6 +413,7 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 3. **Hide mode**: Renames `.mkv` to `.mk_`; subsequent runs find no `.mkv` files
 4. **Show mode**: Renames `.mk_` to `.mkv`; subsequent runs find no `.mk_` files
 5. **Find mode**: Read-only operation, no modifications
+6. **Space mode**: Read-only operation, no modifications
 
 ### Disk Space Safety
 
@@ -400,12 +426,14 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 
 1. **Color coding**:
    - Yellow: Headers, warnings, instructions
-   - Cyan: Informational (mode, estimates, counts)
-   - Green: Success messages
+   - Cyan: Informational (mode, estimates, counts, file sizes)
+   - Blue: Space mode
+   - Green: Success messages, grand totals
    - Red: Errors, failures, space shortage
-   - Gray: Secondary details (presets, rates, times)
+   - Gray: Secondary details (presets, rates, times, file counts)
    - Magenta: Find mode
    - DarkGray: Skipped files
+   - White: Section labels in space mode
 2. **Progress messages**: Display current file being processed
 3. **Summary format**: Consistent header with `===` borders
 4. **Relative paths**: Show relative paths in find mode for readability
@@ -448,6 +476,7 @@ Implement the following functions in order (see detailed specifications in Proce
 
 1. **Header display**: Show title, mode, and target directory
 2. **Mode routing**: Implement conditional logic for each mode:
+   - `space`: Scan for all media files (`.mp4`, `.mp_`, `.mkv`, `.mk_`), calculate sizes, display summary, exit
    - `hide`: Rename `.mkv` → `.mk_`, display summary, exit
    - `show`: Rename `.mk_` → `.mkv`, display summary, exit
    - `find`, `check`, `convert`: Continue to file processing loop
