@@ -8,7 +8,7 @@
     preset based on video resolution (480p or 1080p).
 
 .PARAMETER Mode
-    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), "show" to rename .mk_ back to .mkv, or "space" to analyze disk space usage of media files.
+    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), "show" to rename .mk_ back to .mkv, "space" to analyze disk space usage of media files, "report" to generate a report of MP4 files with resolution information, or "cleanup" to remove .mk_ files that have a valid .mp4 replacement in the same folder.
 
 .PARAMETER Path
     The directory path to scan. Defaults to the current directory if not specified.
@@ -23,7 +23,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("check", "convert", "find", "hide", "show", "space")]
+    [ValidateSet("check", "convert", "find", "hide", "show", "space", "report", "cleanup")]
     [string]$Mode = "check",
     
     [Parameter(Position = 1)]
@@ -70,6 +70,35 @@ function Get-VideoHeight {
     catch {
         Write-Warning "Error scanning file: $FilePath - $_"
         return $null
+    }
+}
+
+# Function to get video format label from height
+function Get-VideoFormatLabel {
+    param (
+        [int]$Height
+    )
+    
+    if ($Height -le 480) {
+        return "480p"
+    }
+    elseif ($Height -le 576) {
+        return "576p"
+    }
+    elseif ($Height -le 720) {
+        return "720p"
+    }
+    elseif ($Height -le 1080) {
+        return "1080p"
+    }
+    elseif ($Height -le 1440) {
+        return "1440p (2K)"
+    }
+    elseif ($Height -le 2160) {
+        return "2160p (4K)"
+    }
+    else {
+        return "${Height}p"
     }
 }
 
@@ -347,6 +376,7 @@ $modeColor = switch ($Mode) {
     "hide" { "Yellow" }
     "show" { "Yellow" }
     "space" { "Blue" }
+    "cleanup" { "Red" }
     default { "Cyan" }
 }
 Write-Host "Mode: $Mode" -ForegroundColor $modeColor
@@ -361,6 +391,76 @@ if (-not (Test-Path $Path)) {
 $currentDir = (Resolve-Path $Path).Path
 Write-Host "Scanning directory: $currentDir" -ForegroundColor Cyan
 Write-Host ""
+
+# Handle report mode - generate report of MP4 files with resolution information
+if ($Mode -eq "report") {
+    Write-Host "Generating MP4 report..." -ForegroundColor Cyan
+    Write-Host ""
+    
+    $reportPath = Join-Path $currentDir "report.txt"
+    $reportLines = @()
+    
+    # Get all subdirectories in the current directory
+    $folders = Get-ChildItem -Path $currentDir -Directory | Sort-Object Name
+    
+    $totalFolders = 0
+    $totalMp4Files = 0
+    
+    foreach ($folder in $folders) {
+        # Find all MP4 files in this folder (non-recursive, only immediate children)
+        $mp4Files = Get-ChildItem -Path $folder.FullName -Filter "*.mp4" -File -ErrorAction SilentlyContinue
+        
+        if ($mp4Files.Count -gt 0) {
+            $totalFolders++
+            $totalMp4Files += $mp4Files.Count
+            
+            # Add folder header to report
+            $reportLines += ""
+            $reportLines += "=" * 80
+            $reportLines += "Folder: $($folder.Name)"
+            $reportLines += "=" * 80
+            
+            Write-Host "Scanning: $($folder.Name)" -ForegroundColor Yellow
+            
+            foreach ($mp4 in $mp4Files) {
+                Write-Host "  Analyzing: $($mp4.Name)" -ForegroundColor Gray
+                
+                # Get video height
+                $height = Get-VideoHeight -FilePath $mp4.FullName
+                
+                if ($null -ne $height) {
+                    $formatLabel = Get-VideoFormatLabel -Height $height
+                    $reportLines += "  $($mp4.Name) - $formatLabel"
+                }
+                else {
+                    $reportLines += "  $($mp4.Name) - (Unable to detect resolution)"
+                }
+            }
+        }
+    }
+    
+    # Add summary at the end
+    $reportLines += ""
+    $reportLines += "=" * 80
+    $reportLines += "Summary"
+    $reportLines += "=" * 80
+    $reportLines += "Total folders with MP4 files: $totalFolders"
+    $reportLines += "Total MP4 files: $totalMp4Files"
+    $reportLines += "Report generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    
+    # Write report to file
+    $reportLines | Out-File -FilePath $reportPath -Encoding UTF8 -Force
+    
+    Write-Host ""
+    Write-Host "=================================" -ForegroundColor Green
+    Write-Host "Report Complete" -ForegroundColor Green
+    Write-Host "=================================" -ForegroundColor Green
+    Write-Host "Folders scanned: $totalFolders" -ForegroundColor Cyan
+    Write-Host "MP4 files found: $totalMp4Files" -ForegroundColor Cyan
+    Write-Host "Report saved to: $reportPath" -ForegroundColor White
+    Write-Host ""
+    exit 0
+}
 
 # Handle space mode - analyze disk usage of media files
 if ($Mode -eq "space") {
@@ -469,6 +569,155 @@ if ($Mode -eq "space") {
             Write-Host "  Used: $usedPercent%" -ForegroundColor Gray
         }
     }
+    Write-Host ""
+    exit 0
+}
+
+# Handle cleanup mode - remove .mk_ files that have valid .mp4 replacements
+if ($Mode -eq "cleanup") {
+    $mk_Files = Get-ChildItem -Path $currentDir -Recurse -Filter "*.mk_" -File -ErrorAction SilentlyContinue
+
+    if ($mk_Files.Count -eq 0) {
+        Write-Host "No .mk_ files found." -ForegroundColor Yellow
+        exit 0
+    }
+
+    Write-Host "Found $($mk_Files.Count) .mk_ file(s) to analyze" -ForegroundColor Cyan
+    Write-Host ""
+
+    $safeToDelete  = [System.Collections.Generic.List[object]]::new()
+    $suspicious    = [System.Collections.Generic.List[object]]::new()
+    $noMp4         = [System.Collections.Generic.List[object]]::new()
+
+    # Minimum thresholds for a "real" MP4:
+    #   - At least 50 MB absolute
+    #   - At least 8% of the .mk_ source size (HandBrake RF18 should never go this low)
+    $minMp4Bytes = 50MB
+    $minSizeRatio = 0.08
+
+    foreach ($mk_ in $mk_Files) {
+        $expectedMp4 = [IO.Path]::ChangeExtension($mk_.FullName, ".mp4")
+
+        if (Test-Path $expectedMp4) {
+            $mp4       = Get-Item $expectedMp4
+            $sizeRatio = if ($mk_.Length -gt 0) { $mp4.Length / $mk_.Length } else { 0 }
+            $mk_MB     = [math]::Round($mk_.Length  / 1MB, 1)
+            $mp4MB     = [math]::Round($mp4.Length  / 1MB, 1)
+            $ratioPct  = [math]::Round($sizeRatio * 100, 1)
+
+            if ($mp4.Length -lt $minMp4Bytes) {
+                $suspicious.Add([PSCustomObject]@{
+                    Mk_File   = $mk_
+                    Mp4File   = $mp4
+                    Mk_MB     = $mk_MB
+                    Mp4MB     = $mp4MB
+                    Issue     = "MP4 is only ${mp4MB} MB — may be incomplete or wrong file"
+                })
+            }
+            elseif ($sizeRatio -lt $minSizeRatio) {
+                $suspicious.Add([PSCustomObject]@{
+                    Mk_File   = $mk_
+                    Mp4File   = $mp4
+                    Mk_MB     = $mk_MB
+                    Mp4MB     = $mp4MB
+                    Issue     = "MP4 is ${ratioPct}% of source — suspiciously small (expected ≥ $([int]($minSizeRatio*100))%)"
+                })
+            }
+            else {
+                $safeToDelete.Add([PSCustomObject]@{
+                    Mk_File   = $mk_
+                    Mp4File   = $mp4
+                    Mk_MB     = $mk_MB
+                    Mp4MB     = $mp4MB
+                    RatioPct  = $ratioPct
+                })
+            }
+        }
+        else {
+            # No same-name MP4 — check if any other .mp4 lives in the same folder (name mismatch)
+            $otherMp4s = Get-ChildItem -Path $mk_.DirectoryName -Filter "*.mp4" -File -ErrorAction SilentlyContinue
+            if ($otherMp4s.Count -gt 0) {
+                foreach ($other in $otherMp4s) {
+                    $suspicious.Add([PSCustomObject]@{
+                        Mk_File  = $mk_
+                        Mp4File  = $other
+                        Mk_MB    = [math]::Round($mk_.Length  / 1MB, 1)
+                        Mp4MB    = [math]::Round($other.Length / 1MB, 1)
+                        Issue    = "Name mismatch — .mk_ is '$($mk_.BaseName)' but .mp4 is '$($other.BaseName)'"
+                    })
+                }
+            }
+            else {
+                $noMp4.Add($mk_)
+            }
+        }
+    }
+
+    # ── Scan report ──────────────────────────────────────────────────────────
+
+    if ($suspicious.Count -gt 0) {
+        Write-Host "SUSPICIOUS — requires manual review ($($suspicious.Count) case(s)):" -ForegroundColor Red
+        Write-Host "  These will NOT be deleted automatically." -ForegroundColor DarkRed
+        Write-Host ""
+        foreach ($item in $suspicious) {
+            Write-Host "  .mk_ : $($item.Mk_File.FullName) ($($item.Mk_MB) MB)" -ForegroundColor Yellow
+            Write-Host "  .mp4 : $($item.Mp4File.FullName) ($($item.Mp4MB) MB)" -ForegroundColor Yellow
+            Write-Host "  Issue: $($item.Issue)" -ForegroundColor Red
+            Write-Host ""
+        }
+    }
+
+    if ($noMp4.Count -gt 0) {
+        Write-Host "NO MP4 FOUND — skipping ($($noMp4.Count) case(s)):" -ForegroundColor DarkGray
+        foreach ($mk_ in $noMp4) {
+            Write-Host "  $($mk_.FullName)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+    }
+
+    if ($safeToDelete.Count -eq 0) {
+        Write-Host "No .mk_ files with a confirmed valid .mp4 replacement found." -ForegroundColor Yellow
+        Write-Host ""
+        exit 0
+    }
+
+    $reclaimableBytes = ($safeToDelete | Measure-Object -Property { $_.Mk_File.Length } -Sum).Sum
+    $reclaimGB = [math]::Round($reclaimableBytes / 1GB, 2)
+    $reclaimMB = [math]::Round($reclaimableBytes / 1MB, 1)
+
+    Write-Host "SAFE TO DELETE ($($safeToDelete.Count) case(s)):" -ForegroundColor Green
+    foreach ($item in $safeToDelete) {
+        Write-Host "  $($item.Mk_File.Name)" -ForegroundColor Cyan
+        Write-Host "    source $($item.Mk_MB) MB  →  mp4 $($item.Mp4MB) MB ($($item.RatioPct)% of source)" -ForegroundColor Gray
+    }
+    Write-Host ""
+    Write-Host "  Space to reclaim: $(if ($reclaimGB -ge 1) { "$reclaimGB GB" } else { "$reclaimMB MB" })" -ForegroundColor Green
+    Write-Host ""
+
+    # ── Delete ───────────────────────────────────────────────────────────────
+
+    $deleted = 0
+    $deleteFailed = 0
+    foreach ($item in $safeToDelete) {
+        try {
+            Remove-Item -Path $item.Mk_File.FullName -Force
+            Write-Host "✓ Deleted: $($item.Mk_File.FullName)" -ForegroundColor Green
+            $deleted++
+        }
+        catch {
+            Write-Warning "Failed to delete: $($item.Mk_File.FullName) — $_"
+            $deleteFailed++
+        }
+    }
+
+    Write-Host ""
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host "Cleanup Summary" -ForegroundColor Yellow
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host "Deleted (.mk_ files removed): $deleted" -ForegroundColor Green
+    if ($deleteFailed -gt 0)       { Write-Host "Failed to delete: $deleteFailed"           -ForegroundColor Red     }
+    if ($suspicious.Count -gt 0)   { Write-Host "Suspicious (skipped): $($suspicious.Count)" -ForegroundColor Yellow  }
+    if ($noMp4.Count -gt 0)        { Write-Host "No MP4 found (skipped): $($noMp4.Count)"    -ForegroundColor DarkGray }
     Write-Host ""
     exit 0
 }
