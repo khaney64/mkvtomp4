@@ -47,7 +47,13 @@ param(
 
     # Allow cleanup to delete sources whose subtitles did not survive conversion.
     [Parameter()]
-    [switch]$SkipSubtitleGuard
+    [switch]$SkipSubtitleGuard,
+
+    # Write a sidecar even when the playable file already has an embedded text
+    # subtitle track. Off by default: such files already work in Plex, and the
+    # sidecar would be redundant.
+    [Parameter()]
+    [switch]$IncludeEmbedded
 )
 
 # Configuration
@@ -1037,6 +1043,7 @@ if ($Mode -eq "backfill") {
 
     $written      = @()
     $alreadyHad   = @()
+    $hasEmbedded  = @()
     $noSource     = @()
     $bitmapOnly   = @()
     $noSubs       = @()
@@ -1056,6 +1063,16 @@ if ($Mode -eq "backfill") {
         if ($existing.Count -gt 0) {
             $alreadyHad += $v.FullName
             continue
+        }
+
+        # A playable file that already carries a text subtitle track works in
+        # Plex as-is; a sidecar would just duplicate it.
+        if (-not $IncludeEmbedded) {
+            $targetSubs = Get-SubtitleStreams -FilePath $v.FullName
+            if (@($targetSubs | Where-Object { $_.IsText }).Count -gt 0) {
+                $hasEmbedded += $v.FullName
+                continue
+            }
         }
 
         $source = $item.Source
@@ -1093,7 +1110,8 @@ if ($Mode -eq "backfill") {
     Write-Host "==================================" -ForegroundColor Yellow
     Write-Host "Titles scanned:              $($items.Count)"
     Write-Host "Sidecar .srt written:        $($written.Count)" -ForegroundColor Green
-    if ($alreadyHad.Count -gt 0) { Write-Host "Already had a sidecar:       $($alreadyHad.Count)" -ForegroundColor DarkGray }
+    if ($alreadyHad.Count -gt 0)  { Write-Host "Already had a sidecar:       $($alreadyHad.Count)"  -ForegroundColor DarkGray }
+    if ($hasEmbedded.Count -gt 0) { Write-Host "Embedded text track, no sidecar needed: $($hasEmbedded.Count)" -ForegroundColor DarkGray }
     if ($noSubs.Count -gt 0)     { Write-Host "Source had no subtitles:     $($noSubs.Count)"     -ForegroundColor DarkGray }
     if ($bitmapOnly.Count -gt 0) { Write-Host "Bitmap subs only (need OCR): $($bitmapOnly.Count)" -ForegroundColor Yellow }
     if ($noSource.Count -gt 0)   { Write-Host "No .mkv/.mk_ source left:    $($noSource.Count)"   -ForegroundColor Red }
