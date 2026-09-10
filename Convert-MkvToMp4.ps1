@@ -512,6 +512,10 @@ function Convert-MkvToMp4 {
         # track. The preset alone would have produced stereo AAC only, silently
         # discarding 5.1.
         #
+        # When passthrough is not possible (DTS in an MP4, say) fall back to
+        # AC3 640k rather than AAC: it keeps all six channels AND direct-plays
+        # on Plex clients that will not touch multichannel AAC.
+        #
         # Subtitles: the presets default to "Foreign Audio Search", which passes
         # nothing through unless forced subs are detected. Select every English
         # track explicitly and burn none of them in.
@@ -527,7 +531,8 @@ function Convert-MkvToMp4 {
             "--mixdown", "5point1,stereo",
             "--aname", "`"Surround,Stereo`"",
             "--audio-copy-mask", $copyMask,
-            "--audio-fallback", "av_aac",
+            "--audio-fallback", "ac3",
+            "-B", "640,160",
             "--subtitle-lang-list", "eng",
             "--all-subtitles",
             "--subtitle-burned=none",
