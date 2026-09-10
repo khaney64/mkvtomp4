@@ -8,31 +8,68 @@
     preset based on video resolution (480p or 1080p).
 
 .PARAMETER Mode
-    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), "show" to rename .mk_ back to .mkv, "space" to analyze disk space usage of media files, "report" to generate a report of MP4 files with resolution information, or "cleanup" to remove .mk_ files that have a valid .mp4 replacement in the same folder.
+    Operation mode: "check" (default) to scan and estimate, "convert" to perform conversions, "find" to list files that already have MP4s, "hide" to rename .mkv to .mk_ (hide from Plex), "show" to rename .mk_ back to .mkv, "space" to analyze disk space usage of media files, "report" to generate a report of MP4 files with resolution information, "cleanup" to remove .mk_ files that have a valid .mp4 replacement in the same folder, or "backfill" to write sidecar .srt files for already-converted videos whose .mkv/.mk_ source still exists.
 
 .PARAMETER Path
     The directory path to scan. Defaults to the current directory if not specified.
 
 .NOTES
     - Requires HandBrakeCLI.exe to be installed
+    - Requires ffmpeg/ffprobe for sidecar subtitle extraction (backfill mode)
     - Uses H.264 encoding with RF 18 quality
     - Web-optimized MP4 output
-    - AC3 audio passthrough when available
+    - Keeps the original surround track (AC3/E-AC3 passthrough) plus an AAC
+      stereo compatibility track
+    - Passes through English subtitles and writes sidecar .srt files.
+      NOTE: MP4 cannot store VobSub (DVD) or PGS (Blu-ray) bitmap subtitles.
+      Use -Container mkv to preserve those as selectable tracks.
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("check", "convert", "find", "hide", "show", "space", "report", "cleanup")]
+    [ValidateSet("check", "convert", "find", "hide", "show", "space", "report", "cleanup", "backfill")]
     [string]$Mode = "check",
     
     [Parameter(Position = 1)]
-    [string]$Path = (Get-Location).Path
+    [string]$Path = (Get-Location).Path,
+
+    # Output container. "mp4" keeps the existing pipeline (text subtitles only -
+    # MP4 cannot carry VobSub/PGS bitmap subtitles). "mkv" preserves every
+    # subtitle track including bitmap ones, at the same encoded file size.
+    [Parameter()]
+    [ValidateSet("mp4", "mkv")]
+    [string]$Container = "mp4",
+
+    # Skip writing sidecar .srt files during convert/backfill.
+    [Parameter()]
+    [switch]$NoSidecar
 )
 
 # Configuration
 $HandBrakeCLI = "C:\Tools\HandBrake\HandBrakeCLI.exe"
 $PerformanceDataFile = "$PSScriptRoot\handbrake_performance.json"
+$OutputExtension = ".$Container"
+
+# Locate ffmpeg/ffprobe - used for sidecar subtitle extraction only.
+function Find-Tool {
+    param([string]$Name)
+    $onPath = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    $candidates = @(
+        "C:\Tools\ffmpeg\bin\$Name.exe",
+        "C:\Tools\ffmpeg\$Name.exe",
+        "C:\ffmpeg\bin\$Name.exe",
+        "C:\Program Files\ffmpeg\bin\$Name.exe",
+        "C:\Program Files\DVDFab\StreamFab\$Name.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    return $null
+}
+
+$FFmpeg  = Find-Tool -Name "ffmpeg"
+$FFprobe = Find-Tool -Name "ffprobe"
+$SubtitleToolsAvailable = ($null -ne $FFmpeg) -and ($null -ne $FFprobe)
 
 # Verify HandBrakeCLI exists
 if (-not (Test-Path $HandBrakeCLI)) {
@@ -271,6 +308,135 @@ function Get-EstimatedConversionTime {
 }
 
 # Function to convert MKV to MP4
+# Text-based subtitle codecs that can be written straight out as SRT.
+$script:TextSubtitleCodecs = @("subrip", "srt", "ass", "ssa", "mov_text", "text", "webvtt")
+
+# Returns the subtitle streams of a media file as objects with
+# Index / Codec / Language / IsText / Forced / HearingImpaired.
+function Get-SubtitleStreams {
+    param([string]$FilePath)
+
+    if (-not $SubtitleToolsAvailable) { return @() }
+
+    try {
+        $json = & $FFprobe -v error `
+            -show_entries "stream=index,codec_type,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired" `
+            -of json "$FilePath" 2>$null | Out-String
+
+        if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+        $parsed = $json | ConvertFrom-Json
+
+        $result = @()
+        foreach ($s in $parsed.streams) {
+            if ($s.codec_type -ne "subtitle") { continue }
+            $lang = if ($s.tags.language) { $s.tags.language } else { "und" }
+            $result += [PSCustomObject]@{
+                Index            = [int]$s.index
+                Codec            = $s.codec_name
+                Language         = $lang
+                Title            = $s.tags.title
+                IsText           = ($script:TextSubtitleCodecs -contains $s.codec_name)
+                Forced           = ([int]$s.disposition.forced -eq 1)
+                HearingImpaired  = ([int]$s.disposition.hearing_impaired -eq 1)
+            }
+        }
+        return $result
+    }
+    catch {
+        Write-Verbose "Could not probe subtitles in ${FilePath}: $_"
+        return @()
+    }
+}
+
+# Extracts every English text subtitle track from $SourcePath into sidecar .srt
+# files named after $VideoPath (Plex convention: <video basename>.en.srt).
+# Returns a result object describing what happened.
+function Export-SidecarSubtitles {
+    param(
+        [string]$SourcePath,   # the .mkv / .mk_ holding the subtitle data
+        [string]$VideoPath,    # the video the sidecar should sit beside
+        [switch]$Force
+    )
+
+    $outcome = [PSCustomObject]@{
+        Source       = $SourcePath
+        Written      = @()
+        Skipped      = 0
+        BitmapOnly   = $false
+        TextTracks   = 0
+        Error        = $null
+    }
+
+    if (-not $SubtitleToolsAvailable) {
+        $outcome.Error = "ffmpeg/ffprobe not found"
+        return $outcome
+    }
+
+    $subs = Get-SubtitleStreams -FilePath $SourcePath
+    if ($subs.Count -eq 0) { return $outcome }
+
+    $english = @($subs | Where-Object { $_.Language -in @("eng", "en") })
+    # If nothing is tagged English, fall back to untagged tracks - single-language
+    # discs frequently leave the language field empty.
+    if ($english.Count -eq 0) {
+        $english = @($subs | Where-Object { $_.Language -in @("und", "") })
+    }
+
+    $textTracks = @($english | Where-Object { $_.IsText })
+    $outcome.TextTracks = $textTracks.Count
+
+    if ($textTracks.Count -eq 0) {
+        $outcome.BitmapOnly = ($english.Count -gt 0)
+        return $outcome
+    }
+
+    $baseDir  = [IO.Path]::GetDirectoryName($VideoPath)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
+
+    $n = 0
+    foreach ($t in $textTracks) {
+        $n++
+        # First track gets the plain .en.srt name Plex prefers; extra tracks are
+        # disambiguated so they do not collide.
+        $suffix = if ($n -eq 1) { "en" } else { "en.$n" }
+        if ($t.HearingImpaired -and $n -eq 1 -and $textTracks.Count -gt 1) { $suffix = "en.sdh" }
+        if ($t.Forced) { $suffix = "en.forced" }
+
+        $srtPath = Join-Path $baseDir "$baseName.$suffix.srt"
+
+        if ((Test-Path $srtPath) -and -not $Force) {
+            $outcome.Skipped++
+            continue
+        }
+
+        & $FFmpeg -v error -y -i "$SourcePath" -map "0:$($t.Index)" -c:s srt "$srtPath" 2>$null
+
+        if ((Test-Path $srtPath) -and ((Get-Item $srtPath).Length -gt 0)) {
+            $outcome.Written += $srtPath
+        }
+        else {
+            if (Test-Path $srtPath) { Remove-Item $srtPath -Force -ErrorAction SilentlyContinue }
+            $outcome.Error = "extraction produced no output for stream $($t.Index)"
+        }
+    }
+
+    return $outcome
+}
+
+# Finds the .mkv or .mk_ that a converted video came from, if it still exists.
+function Get-SourceForVideo {
+    param([string]$VideoPath)
+
+    $baseDir  = [IO.Path]::GetDirectoryName($VideoPath)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
+
+    foreach ($ext in @(".mkv", ".mk_")) {
+        $candidate = Join-Path $baseDir "$baseName$ext"
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return $null
+}
+
 function Convert-MkvToMp4 {
     param (
         [string]$InputPath,
@@ -281,6 +447,8 @@ function Convert-MkvToMp4 {
     try {
         # Use temporary extension .mp_ during conversion
         $tempOutputPath = [IO.Path]::ChangeExtension($OutputPath, ".mp_")
+        # HandBrake picks the muxer from -f, but honours the output extension for
+        # some container defaults; keep the temp name aligned with the real one.
         
         Write-Host "Converting: $InputPath" -ForegroundColor Cyan
         Write-Host "Using preset: $Preset" -ForegroundColor Gray
@@ -295,18 +463,37 @@ function Convert-MkvToMp4 {
         $sourceSize = (Get-Item $InputPath).Length
         
         # Build HandBrake command
-        # -e x264: H.264 encoder
-        # -q 18: RF 18 quality
-        # -O: Web optimized
-        # --audio-copy-mask ac3: AC3 passthrough
-        # --audio-fallback: Default audio fallback
+        # -e x264 / -q 18: H.264 at RF 18
+        # -O: web optimized (mp4 only)
+        #
+        # Audio: emit two tracks from source track 1 - the original surround
+        # stream passed through untouched, plus an AAC stereo compatibility
+        # track. The preset alone would have produced stereo AAC only, silently
+        # discarding 5.1.
+        #
+        # Subtitles: the presets default to "Foreign Audio Search", which passes
+        # nothing through unless forced subs are detected. Select every English
+        # track explicitly and burn none of them in.
+        $copyMask = if ($Container -eq "mkv") { "ac3,eac3,dts,dtshd,truehd" } else { "ac3,eac3" }
+
         $arguments = @(
             "--preset", "`"$Preset`"",
             "-e", "x264",
             "-q", "18",
-            "-O",
-            "--audio-copy-mask", "ac3",
+            "-f", $(if ($Container -eq "mkv") { "av_mkv" } else { "av_mp4" }),
+            "-a", "1,1",
+            "-E", "copy,av_aac",
+            "--mixdown", "5point1,stereo",
+            "--aname", "`"Surround,Stereo`"",
+            "--audio-copy-mask", $copyMask,
             "--audio-fallback", "av_aac",
+            "--subtitle-lang-list", "eng",
+            "--all-subtitles",
+            "--subtitle-burned=none",
+            "--subtitle-default=none"
+        )
+        if ($Container -eq "mp4") { $arguments += "-O" }
+        $arguments += @(
             "-i", "`"$InputPath`"",
             "-o", "`"$tempOutputPath`""
         )
@@ -333,6 +520,13 @@ function Convert-MkvToMp4 {
             if (Test-Path $tempOutputPath) {
                 Rename-Item -Path $tempOutputPath -NewName ([IO.Path]::GetFileName($OutputPath)) -Force
                 
+                # Write sidecar .srt alongside the output - the most reliable
+                # subtitle path in Plex (direct-plays on every client, never
+                # forces a transcode).
+                if (-not $NoSidecar) {
+                    $null = Export-SidecarSubtitles -SourcePath $InputPath -VideoPath $OutputPath
+                }
+
                 # Update performance metrics
                 Update-PerformanceMetrics -SourceSizeBytes $sourceSize -ConversionTimeMinutes $elapsedMinutes
                 
@@ -718,6 +912,113 @@ if ($Mode -eq "cleanup") {
     if ($deleteFailed -gt 0)       { Write-Host "Failed to delete: $deleteFailed"           -ForegroundColor Red     }
     if ($suspicious.Count -gt 0)   { Write-Host "Suspicious (skipped): $($suspicious.Count)" -ForegroundColor Yellow  }
     if ($noMp4.Count -gt 0)        { Write-Host "No MP4 found (skipped): $($noMp4.Count)"    -ForegroundColor DarkGray }
+    Write-Host ""
+    exit 0
+}
+
+# Handle backfill mode - write sidecar .srt files for videos that were converted
+# before subtitle preservation existed. Requires the original .mkv/.mk_ to still
+# be present; the subtitle data cannot be recovered from the .mp4 alone.
+if ($Mode -eq "backfill") {
+    if (-not $SubtitleToolsAvailable) {
+        Write-Error "backfill needs ffmpeg and ffprobe. Install them to C:\Tools\ffmpeg\bin or put them on PATH."
+        exit 1
+    }
+
+    Write-Host "ffmpeg:  $FFmpeg"  -ForegroundColor DarkGray
+    Write-Host "ffprobe: $FFprobe" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $videos = Get-ChildItem -Path $currentDir -Recurse -File -Include "*.mp4", "*.m4v" -ErrorAction SilentlyContinue
+
+    if ($videos.Count -eq 0) {
+        Write-Host "No MP4 files found under: $currentDir" -ForegroundColor Yellow
+        exit 0
+    }
+
+    Write-Host "Scanning $($videos.Count) video file(s)..." -ForegroundColor Cyan
+    Write-Host ""
+
+    $written      = @()
+    $alreadyHad   = @()
+    $noSource     = @()
+    $bitmapOnly   = @()
+    $noSubs       = @()
+    $failed       = @()
+
+    $i = 0
+    foreach ($v in $videos) {
+        $i++
+        Write-Progress -Activity "Backfilling subtitles" -Status $v.Name -PercentComplete (($i / $videos.Count) * 100)
+
+        $baseDir  = $v.DirectoryName
+        $baseName = [IO.Path]::GetFileNameWithoutExtension($v.FullName)
+
+        # Any existing sidecar for this video means there is nothing to do.
+        $existing = @(Get-ChildItem -Path $baseDir -Filter "$baseName*.srt" -File -ErrorAction SilentlyContinue)
+        if ($existing.Count -gt 0) {
+            $alreadyHad += $v.FullName
+            continue
+        }
+
+        $source = Get-SourceForVideo -VideoPath $v.FullName
+        if (-not $source) {
+            $noSource += $v.FullName
+            continue
+        }
+
+        $r = Export-SidecarSubtitles -SourcePath $source -VideoPath $v.FullName
+
+        if ($r.Error) {
+            $failed += "$($v.Name) - $($r.Error)"
+        }
+        elseif ($r.Written.Count -gt 0) {
+            $written += $r.Written
+            Write-Host "  + $([IO.Path]::GetFileName($r.Written[0]))" -ForegroundColor Green
+            foreach ($extra in ($r.Written | Select-Object -Skip 1)) {
+                Write-Host "  + $([IO.Path]::GetFileName($extra))" -ForegroundColor Green
+            }
+        }
+        elseif ($r.BitmapOnly) {
+            $bitmapOnly += $v.FullName
+        }
+        else {
+            $noSubs += $v.FullName
+        }
+    }
+    Write-Progress -Activity "Backfilling subtitles" -Completed
+
+    Write-Host ""
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host "  Backfill summary" -ForegroundColor Yellow
+    Write-Host "==================================" -ForegroundColor Yellow
+    Write-Host "Videos scanned:              $($videos.Count)"
+    Write-Host "Sidecar .srt written:        $($written.Count)" -ForegroundColor Green
+    if ($alreadyHad.Count -gt 0) { Write-Host "Already had a sidecar:       $($alreadyHad.Count)" -ForegroundColor DarkGray }
+    if ($noSubs.Count -gt 0)     { Write-Host "Source had no subtitles:     $($noSubs.Count)"     -ForegroundColor DarkGray }
+    if ($bitmapOnly.Count -gt 0) { Write-Host "Bitmap subs only (need OCR): $($bitmapOnly.Count)" -ForegroundColor Yellow }
+    if ($noSource.Count -gt 0)   { Write-Host "No .mkv/.mk_ source left:    $($noSource.Count)"   -ForegroundColor Red }
+    if ($failed.Count -gt 0)     { Write-Host "Failed:                      $($failed.Count)"     -ForegroundColor Red }
+
+    if ($bitmapOnly.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Bitmap-only sources (VobSub/PGS - run these through Subtitle Edit OCR):" -ForegroundColor Yellow
+        $bitmapOnly | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkYellow }
+        if ($bitmapOnly.Count -gt 20) { Write-Host "  ... and $($bitmapOnly.Count - 20) more" -ForegroundColor DarkYellow }
+    }
+
+    if ($failed.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Failures:" -ForegroundColor Red
+        $failed | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    }
+
+    if ($noSource.Count -gt 0) {
+        Write-Host ""
+        Write-Host "$($noSource.Count) file(s) have no surviving .mkv/.mk_ - their subtitles" -ForegroundColor Red
+        Write-Host "cannot be recovered locally. Use Bazarr or Plex's OpenSubtitles agent." -ForegroundColor Red
+    }
+
     Write-Host ""
     exit 0
 }
