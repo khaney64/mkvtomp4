@@ -43,7 +43,11 @@ param(
 
     # Skip writing sidecar .srt files during convert/backfill.
     [Parameter()]
-    [switch]$NoSidecar
+    [switch]$NoSidecar,
+
+    # Allow cleanup to delete sources whose subtitles did not survive conversion.
+    [Parameter()]
+    [switch]$SkipSubtitleGuard
 )
 
 # Configuration
@@ -423,6 +427,37 @@ function Export-SidecarSubtitles {
     return $outcome
 }
 
+# Decides whether it is safe to delete $SourcePath now that $ReplacementPath
+# exists. Deleting a source is irreversible and the subtitle data lives ONLY in
+# the source, so this errs toward refusing.
+# Returns $null when safe, or a string describing what would be lost.
+function Get-SubtitleLossReason {
+    param(
+        [string]$SourcePath,
+        [string]$ReplacementPath
+    )
+
+    if (-not $SubtitleToolsAvailable) {
+        return "cannot verify - ffmpeg/ffprobe not found"
+    }
+
+    $sourceSubs = Get-SubtitleStreams -FilePath $SourcePath
+    if ($sourceSubs.Count -eq 0) { return $null }   # nothing to lose
+
+    # A sidecar .srt beside the replacement counts as preserved.
+    $baseDir  = [IO.Path]::GetDirectoryName($ReplacementPath)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($ReplacementPath)
+    $sidecars = @(Get-ChildItem -Path $baseDir -Filter "$baseName*.srt" -File -ErrorAction SilentlyContinue)
+    if ($sidecars.Count -gt 0) { return $null }
+
+    # An embedded subtitle track in the replacement counts as preserved.
+    $destSubs = Get-SubtitleStreams -FilePath $ReplacementPath
+    if ($destSubs.Count -gt 0) { return $null }
+
+    $kinds = ($sourceSubs.Codec | Sort-Object -Unique) -join ", "
+    return "source has $($sourceSubs.Count) subtitle track(s) [$kinds]; replacement has none and no sidecar .srt exists"
+}
+
 # Finds the .mkv or .mk_ that a converted video came from, if it still exists.
 function Get-SourceForVideo {
     param([string]$VideoPath)
@@ -782,6 +817,17 @@ if ($Mode -eq "cleanup") {
     $safeToDelete  = [System.Collections.Generic.List[object]]::new()
     $suspicious    = [System.Collections.Generic.List[object]]::new()
     $noMp4         = [System.Collections.Generic.List[object]]::new()
+    $subtitleLoss  = [System.Collections.Generic.List[object]]::new()
+
+    if ($SkipSubtitleGuard) {
+        Write-Host "WARNING: -SkipSubtitleGuard is set. Sources will be deleted even if" -ForegroundColor Red
+        Write-Host "         their subtitles did not survive conversion." -ForegroundColor Red
+        Write-Host ""
+    }
+    elseif (-not $SubtitleToolsAvailable) {
+        Write-Error "cleanup needs ffmpeg/ffprobe to verify subtitles survived before deleting sources. Install them, or re-run with -SkipSubtitleGuard to delete anyway."
+        exit 1
+    }
 
     # Minimum thresholds for a "real" MP4:
     #   - At least 50 MB absolute
@@ -818,13 +864,30 @@ if ($Mode -eq "cleanup") {
                 })
             }
             else {
-                $safeToDelete.Add([PSCustomObject]@{
-                    Mk_File   = $mk_
-                    Mp4File   = $mp4
-                    Mk_MB     = $mk_MB
-                    Mp4MB     = $mp4MB
-                    RatioPct  = $ratioPct
-                })
+                # Size looks right - now confirm the subtitles actually made it
+                # across before letting the only copy be deleted.
+                $lossReason = if ($SkipSubtitleGuard) { $null } else {
+                    Get-SubtitleLossReason -SourcePath $mk_.FullName -ReplacementPath $mp4.FullName
+                }
+
+                if ($lossReason) {
+                    $subtitleLoss.Add([PSCustomObject]@{
+                        Mk_File = $mk_
+                        Mp4File = $mp4
+                        Mk_MB   = $mk_MB
+                        Mp4MB   = $mp4MB
+                        Issue   = $lossReason
+                    })
+                }
+                else {
+                    $safeToDelete.Add([PSCustomObject]@{
+                        Mk_File   = $mk_
+                        Mp4File   = $mp4
+                        Mk_MB     = $mk_MB
+                        Mp4MB     = $mp4MB
+                        RatioPct  = $ratioPct
+                    })
+                }
             }
         }
         else {
@@ -861,6 +924,18 @@ if ($Mode -eq "cleanup") {
         }
     }
 
+    if ($subtitleLoss.Count -gt 0) {
+        Write-Host "SUBTITLES WOULD BE LOST — blocked ($($subtitleLoss.Count) case(s)):" -ForegroundColor Red
+        Write-Host "  These will NOT be deleted. Run 'backfill' first to write sidecar .srt files," -ForegroundColor DarkRed
+        Write-Host "  or re-convert with the current script, then re-run cleanup." -ForegroundColor DarkRed
+        Write-Host ""
+        foreach ($item in $subtitleLoss) {
+            Write-Host "  .mk_ : $($item.Mk_File.FullName) ($($item.Mk_MB) MB)" -ForegroundColor Yellow
+            Write-Host "  Issue: $($item.Issue)" -ForegroundColor Red
+            Write-Host ""
+        }
+    }
+
     if ($noMp4.Count -gt 0) {
         Write-Host "NO MP4 FOUND — skipping ($($noMp4.Count) case(s)):" -ForegroundColor DarkGray
         foreach ($mk_ in $noMp4) {
@@ -870,7 +945,7 @@ if ($Mode -eq "cleanup") {
     }
 
     if ($safeToDelete.Count -eq 0) {
-        Write-Host "No .mk_ files with a confirmed valid .mp4 replacement found." -ForegroundColor Yellow
+        Write-Host "No .mk_ files cleared for deletion." -ForegroundColor Yellow
         Write-Host ""
         exit 0
     }
@@ -911,6 +986,7 @@ if ($Mode -eq "cleanup") {
     Write-Host "Deleted (.mk_ files removed): $deleted" -ForegroundColor Green
     if ($deleteFailed -gt 0)       { Write-Host "Failed to delete: $deleteFailed"           -ForegroundColor Red     }
     if ($suspicious.Count -gt 0)   { Write-Host "Suspicious (skipped): $($suspicious.Count)" -ForegroundColor Yellow  }
+    if ($subtitleLoss.Count -gt 0) { Write-Host "Blocked - subtitle loss: $($subtitleLoss.Count)" -ForegroundColor Red }
     if ($noMp4.Count -gt 0)        { Write-Host "No MP4 found (skipped): $($noMp4.Count)"    -ForegroundColor DarkGray }
     Write-Host ""
     exit 0
@@ -929,14 +1005,34 @@ if ($Mode -eq "backfill") {
     Write-Host "ffprobe: $FFprobe" -ForegroundColor DarkGray
     Write-Host ""
 
-    $videos = Get-ChildItem -Path $currentDir -Recurse -File -Include "*.mp4", "*.m4v" -ErrorAction SilentlyContinue
+    $mediaFiles = Get-ChildItem -Path $currentDir -Recurse -File -Include "*.mp4", "*.m4v", "*.mkv", "*.mk_" -ErrorAction SilentlyContinue
 
-    if ($videos.Count -eq 0) {
-        Write-Host "No MP4 files found under: $currentDir" -ForegroundColor Yellow
+    if ($mediaFiles.Count -eq 0) {
+        Write-Host "No video files found under: $currentDir" -ForegroundColor Yellow
         exit 0
     }
 
-    Write-Host "Scanning $($videos.Count) video file(s)..." -ForegroundColor Cyan
+    # Group by folder + basename so a converted pair (Foo.mk_ + Foo.mp4) is a
+    # single unit of work: the sidecar is named after the file Plex will play,
+    # while the subtitles are read from whichever member still holds them.
+    $groups = $mediaFiles | Group-Object { [IO.Path]::Combine($_.DirectoryName, [IO.Path]::GetFileNameWithoutExtension($_.Name)) }
+
+    $items = foreach ($g in $groups) {
+        $t = @($g.Group | Where-Object { $_.Extension -in ".mp4", ".m4v" })[0]
+        if (-not $t) { $t = @($g.Group | Where-Object { $_.Extension -eq ".mkv" })[0] }
+        if (-not $t) { $t = @($g.Group | Where-Object { $_.Extension -eq ".mk_" })[0] }
+        if (-not $t) { continue }
+
+        # Prefer the original as the subtitle source; fall back to the playable
+        # file, which may still carry an embedded text track worth extracting.
+        $s = @($g.Group | Where-Object { $_.Extension -in ".mkv", ".mk_" })[0]
+        if (-not $s) { $s = $t }
+
+        [PSCustomObject]@{ Target = $t; Source = $s }
+    }
+    $items = @($items)
+
+    Write-Host "Scanning $($items.Count) title(s) across $($mediaFiles.Count) file(s)..." -ForegroundColor Cyan
     Write-Host ""
 
     $written      = @()
@@ -947,9 +1043,10 @@ if ($Mode -eq "backfill") {
     $failed       = @()
 
     $i = 0
-    foreach ($v in $videos) {
+    foreach ($item in $items) {
         $i++
-        Write-Progress -Activity "Backfilling subtitles" -Status $v.Name -PercentComplete (($i / $videos.Count) * 100)
+        $v = $item.Target
+        Write-Progress -Activity "Backfilling subtitles" -Status $v.Name -PercentComplete (($i / $items.Count) * 100)
 
         $baseDir  = $v.DirectoryName
         $baseName = [IO.Path]::GetFileNameWithoutExtension($v.FullName)
@@ -961,13 +1058,10 @@ if ($Mode -eq "backfill") {
             continue
         }
 
-        $source = Get-SourceForVideo -VideoPath $v.FullName
-        if (-not $source) {
-            $noSource += $v.FullName
-            continue
-        }
+        $source = $item.Source
+        $sourceIsSelf = ($source.FullName -eq $v.FullName)
 
-        $r = Export-SidecarSubtitles -SourcePath $source -VideoPath $v.FullName
+        $r = Export-SidecarSubtitles -SourcePath $source.FullName -VideoPath $v.FullName
 
         if ($r.Error) {
             $failed += "$($v.Name) - $($r.Error)"
@@ -982,6 +1076,11 @@ if ($Mode -eq "backfill") {
         elseif ($r.BitmapOnly) {
             $bitmapOnly += $v.FullName
         }
+        elseif ($sourceIsSelf -and $v.Extension -in ".mp4", ".m4v") {
+            # Nothing left to read from: the source is gone and the MP4 itself
+            # carries no subtitles.
+            $noSource += $v.FullName
+        }
         else {
             $noSubs += $v.FullName
         }
@@ -992,7 +1091,7 @@ if ($Mode -eq "backfill") {
     Write-Host "==================================" -ForegroundColor Yellow
     Write-Host "  Backfill summary" -ForegroundColor Yellow
     Write-Host "==================================" -ForegroundColor Yellow
-    Write-Host "Videos scanned:              $($videos.Count)"
+    Write-Host "Titles scanned:              $($items.Count)"
     Write-Host "Sidecar .srt written:        $($written.Count)" -ForegroundColor Green
     if ($alreadyHad.Count -gt 0) { Write-Host "Already had a sidecar:       $($alreadyHad.Count)" -ForegroundColor DarkGray }
     if ($noSubs.Count -gt 0)     { Write-Host "Source had no subtitles:     $($noSubs.Count)"     -ForegroundColor DarkGray }
