@@ -478,6 +478,44 @@ function Get-SourceForVideo {
     return $null
 }
 
+# HandBrake selects audio by track NUMBER, and disc track order is not
+# consistent - some titles list the stereo mix before the 5.1 one. Find the
+# richest track instead of assuming position 1.
+# Returns a 1-based index among the source's audio streams.
+function Get-BestAudioTrack {
+    param([string]$FilePath)
+
+    if (-not $SubtitleToolsAvailable) { return 1 }
+
+    try {
+        $lines = @(& $FFprobe -v error -select_streams a `
+                    -show_entries stream=codec_name,channels -of csv=p=0 "$FilePath" 2>$null)
+        if ($lines.Count -eq 0) { return 1 }
+
+        $i = 0; $best = 1; $bestCh = -1; $bestRank = 9
+        foreach ($line in $lines) {
+            $i++
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            # ffprobe can emit a trailing empty field; drop it before splitting
+            $parts = ($line -replace ',+\s*$', '') -split ','
+            $codec = $parts[0]
+            $ch = 0
+            if ($parts.Count -gt 1) { [int]::TryParse($parts[1], [ref]$ch) | Out-Null }
+
+            # Prefer more channels; break ties toward a codec MP4 can pass through.
+            $rank = if ($codec -in @('ac3', 'eac3')) { 0 } else { 1 }
+            if ($ch -gt $bestCh -or ($ch -eq $bestCh -and $rank -lt $bestRank)) {
+                $best = $i; $bestCh = $ch; $bestRank = $rank
+            }
+        }
+        return $best
+    }
+    catch {
+        Write-Verbose "Could not determine best audio track for ${FilePath}: $_"
+        return 1
+    }
+}
+
 function Convert-MkvToMp4 {
     param (
         [string]$InputPath,
@@ -520,13 +558,15 @@ function Convert-MkvToMp4 {
         # nothing through unless forced subs are detected. Select every English
         # track explicitly and burn none of them in.
         $copyMask = if ($Container -eq "mkv") { "ac3,eac3,dts,dtshd,truehd" } else { "ac3,eac3" }
+        $audioTrack = Get-BestAudioTrack -FilePath $InputPath
+        Write-Host "Using source audio track: $audioTrack" -ForegroundColor Gray
 
         $arguments = @(
             "--preset", "`"$Preset`"",
             "-e", "x264",
             "-q", "18",
             "-f", $(if ($Container -eq "mkv") { "av_mkv" } else { "av_mp4" }),
-            "-a", "1,1",
+            "-a", "$audioTrack,$audioTrack",
             "-E", "copy,av_aac",
             "--mixdown", "5point1,stereo",
             "--aname", "`"Surround,Stereo`"",
