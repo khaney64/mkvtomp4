@@ -1,0 +1,9 @@
+# This repo lives inside the movie library, so ignore everything...
+/*
+
+# ...and re-include only the tooling.
+!/.gitignore
+!/Convert-MkvToMp4.ps1
+!/README.md
+!/copilot-instructions.md
+!/handbrake_performance.json
