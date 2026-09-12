@@ -640,6 +640,58 @@ function Write-SubtitleOutcome {
     }
 }
 
+# Works out which source subtitle tracks HandBrake should select.
+#
+# HandBrake numbers subtitles 1..n in source order. Selecting a track the
+# container cannot carry makes HandBrake burn it into the video rather than skip
+# it, so anything unmuxable must be excluded here.
+#
+# Returns a HandBrake -s value: "1,3", or "none" when nothing is carryable.
+function Get-SubtitleSelection {
+    param(
+        [string]$FilePath,
+        [string]$ForContainer   # 'mp4' or 'mkv'
+    )
+
+    if (-not $SubtitleToolsAvailable) { return 'none' }
+
+    # MP4 can hold text (as mov_text) and, non-standardly, VobSub. It cannot
+    # hold PGS or DVB at all. MKV holds everything.
+    $carryable = if ($ForContainer -eq 'mkv') {
+        @('subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text', 'dvd_subtitle', 'hdmv_pgs_subtitle', 'dvb_subtitle')
+    } else {
+        @('subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text', 'dvd_subtitle')
+    }
+
+    try {
+        $lines = @(& $FFprobe -v error -select_streams s `
+                    -show_entries 'stream=codec_name:stream_tags=language' `
+                    -of csv=p=0 "$FilePath" 2>$null)
+        if ($lines.Count -eq 0) { return 'none' }
+
+        $keep = @()
+        $n = 0
+        foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $n++                                     # HandBrake's 1-based track number
+            $parts = ($line -replace ',+\s*$', '') -split ','
+            $codec = $parts[0]
+            $lang = if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { 'und' }
+
+            if ($lang -notin @('eng', 'en', 'und', '')) { continue }
+            if ($carryable -notcontains $codec) { continue }
+            $keep += $n
+        }
+
+        if ($keep.Count -eq 0) { return 'none' }
+        return ($keep -join ',')
+    }
+    catch {
+        Write-Verbose "Could not build a subtitle selection for ${FilePath}: $_"
+        return 'none'
+    }
+}
+
 function Convert-MkvToMp4 {
     param (
         [string]$InputPath,
@@ -682,6 +734,13 @@ function Convert-MkvToMp4 {
         # nothing through unless forced subs are detected. Select every English
         # track explicitly and burn none of them in.
         $copyMask = if ($Container -eq "mkv") { "ac3,eac3,dts,dtshd,truehd" } else { "ac3,eac3" }
+        $subSelection = Get-SubtitleSelection -FilePath $InputPath -ForContainer $Container
+        if ($subSelection -eq 'none') {
+            Write-Host "Subtitles: none can be carried into $Container - selecting none (avoids burn-in)" -ForegroundColor Gray
+        } else {
+            Write-Host "Subtitles: selecting source track(s) $subSelection" -ForegroundColor Gray
+        }
+
         $audioInfo   = Get-BestAudioTrack -FilePath $InputPath
         $audioTrack  = $audioInfo.Index
         $surroundKbps = Get-Ac3Bitrate -Channels $audioInfo.Channels
@@ -700,8 +759,7 @@ function Convert-MkvToMp4 {
             "--audio-copy-mask", $copyMask,
             "--audio-fallback", "ac3",
             "-B", "$surroundKbps,160",
-            "--subtitle-lang-list", "eng",
-            "--all-subtitles",
+            "--subtitle", $subSelection,
             "--subtitle-burned=none",
             "--subtitle-default=none"
         )
