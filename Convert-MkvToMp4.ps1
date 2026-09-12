@@ -53,7 +53,11 @@ param(
     # subtitle track. Off by default: such files already work in Plex, and the
     # sidecar would be redundant.
     [Parameter()]
-    [switch]$IncludeEmbedded
+    [switch]$IncludeEmbedded,
+
+    # Skip writing .sup sidecars for bitmap subtitles MP4 cannot carry.
+    [Parameter()]
+    [switch]$NoSup
 )
 
 # Configuration
@@ -532,11 +536,56 @@ function Get-BestAudioTrack {
 
 # Reports what happened to the source's subtitles, so a title that ends up with
 # none is obvious at conversion time rather than discovered later in Plex.
+# PGS/DVB cannot live in an MP4, so after conversion their only copy is inside
+# the source .mkv. Lift them out to a .sup beside the OUTPUT, so the subtitles
+# survive deleting the source. Costs well under 1% of the source size.
+# Returns the paths written.
+function Export-BitmapSubtitles {
+    param(
+        [string]$SourcePath,
+        [string]$VideoPath
+    )
+
+    $written = @()
+    if (-not $SubtitleToolsAvailable -or -not $FFmpeg) { return $written }
+
+    $blockedCodecs = @('hdmv_pgs_subtitle', 'dvb_subtitle')
+    $subs = @(Get-SubtitleStreams -FilePath $SourcePath |
+              Where-Object { $blockedCodecs -contains $_.Codec -and
+                             $_.Language -in @('eng', 'en', 'und', '') })
+    if ($subs.Count -eq 0) { return $written }
+
+    $baseDir  = [IO.Path]::GetDirectoryName($VideoPath)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
+
+    $n = 0
+    foreach ($s in $subs) {
+        $n++
+        $suffix = if ($n -eq 1) { 'en' } else { "en.$n" }
+        if ($s.Forced) { $suffix = "en.forced" }
+        $dest = Join-Path $baseDir "$baseName.$suffix.sup"
+        if (Test-Path $dest) { $written += $dest; continue }
+
+        & $FFmpeg -nostdin -v error -y -i "$SourcePath" -map "0:$($s.Index)" -c:s copy "$dest" 2>$null
+
+        if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0) {
+            $written += $dest
+            Write-Host ("             saved {0} ({1:N1} MB) - OCR it later with Subtitle Edit" -f
+                        [IO.Path]::GetFileName($dest), ((Get-Item $dest).Length / 1MB)) -ForegroundColor Cyan
+        }
+        elseif (Test-Path $dest) {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $written
+}
+
 function Write-SubtitleOutcome {
     param(
         [string]$SourcePath,
         [string]$OutputPath,
-        [string]$SidecarPath
+        [string]$SidecarPath,
+        [string[]]$SupPaths = @()
     )
 
     if (-not $SubtitleToolsAvailable) { return }
@@ -566,6 +615,10 @@ function Write-SubtitleOutcome {
     if ($blocked.Count -gt 0 -and $Container -eq "mp4") {
         Write-Host ("             {0} {1} track(s) could NOT be written to MP4 (the container does not support them)." -f
             $blocked.Count, (($blocked.Codec | Sort-Object -Unique) -join '/')) -ForegroundColor Yellow
+        if ($SupPaths.Count -gt 0) {
+            Write-Host ("             -> preserved as {0} .sup sidecar(s); keep them WITH the .mp4," -f $SupPaths.Count) -ForegroundColor Cyan
+            Write-Host "                they are the only copy once the source is deleted." -ForegroundColor Cyan
+        }
     }
     if ($dropped.Count -gt 0) {
         Write-Host ("             {0} non-English track(s) skipped." -f $dropped.Count) -ForegroundColor DarkGray
@@ -684,7 +737,16 @@ function Convert-MkvToMp4 {
                     $sidecarResult = Export-SidecarSubtitles -SourcePath $InputPath -VideoPath $OutputPath
                 }
                 $sidecarPath = if ($sidecarResult -and $sidecarResult.Written.Count -gt 0) { $sidecarResult.Written[0] } else { $null }
-                Write-SubtitleOutcome -SourcePath $InputPath -OutputPath $OutputPath -SidecarPath $sidecarPath
+
+                # Bitmap tracks MP4 refuses would otherwise exist only inside the
+                # source, so pull them out before that gets deleted.
+                $supPaths = @()
+                if (-not $NoSup -and $Container -eq "mp4") {
+                    $supPaths = @(Export-BitmapSubtitles -SourcePath $InputPath -VideoPath $OutputPath)
+                }
+
+                Write-SubtitleOutcome -SourcePath $InputPath -OutputPath $OutputPath `
+                                      -SidecarPath $sidecarPath -SupPaths $supPaths
 
                 # Update performance metrics
                 Update-PerformanceMetrics -SourceSizeBytes $sourceSize -ConversionTimeMinutes $elapsedMinutes
