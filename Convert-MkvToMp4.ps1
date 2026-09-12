@@ -57,7 +57,11 @@ param(
 
     # Skip writing .sup sidecars for bitmap subtitles MP4 cannot carry.
     [Parameter()]
-    [switch]$NoSup
+    [switch]$NoSup,
+
+    # Keep the embedded title tag HandBrake copies from the source disc.
+    [Parameter()]
+    [switch]$KeepEmbeddedTitle
 )
 
 # Configuration
@@ -83,6 +87,15 @@ function Find-Tool {
 
 $FFmpeg  = Find-Tool -Name "ffmpeg"
 $FFprobe = Find-Tool -Name "ffprobe"
+
+# Optional. Used only to remove the embedded title tag after conversion.
+$AtomicParsley = $null
+foreach ($c in @(
+        "C:\Tools\AtomicParsley\AtomicParsley.exe",
+        "D:\tivo\kmttg_v2.4p\AtomicParsley\AtomicParsley.exe")) {
+    if (Test-Path $c) { $AtomicParsley = $c; break }
+}
+if (-not $AtomicParsley) { $AtomicParsley = (Get-Command AtomicParsley -ErrorAction SilentlyContinue).Source }
 $SubtitleToolsAvailable = ($null -ne $FFmpeg) -and ($null -ne $FFprobe)
 
 # Verify HandBrakeCLI exists
@@ -584,6 +597,37 @@ function Export-BitmapSubtitles {
     return $written
 }
 
+# HandBrake stamps the source disc's label into the MP4 as a title tag, and
+# Plex prefers that over the title it matched - so the library ends up showing
+# things like "NIGHTMARE ALLEY - DISC ONE". Removing the tag lets Plex title the
+# film from the filename, which is already correct.
+#
+# This is cheap: MP4 metadata lives in the small `moov` atom, not the multi-GB
+# `mdat` payload, and deleting a tag frees space rather than needing more, so
+# AtomicParsley patches it in place without touching the media (~83ms on 271MB).
+function Remove-EmbeddedTitle {
+    param([string]$FilePath)
+
+    if (-not $AtomicParsley) { return }
+
+    $before = & $FFprobe -v error -show_entries format_tags=title -of csv=p=0 "$FilePath" 2>$null | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($before)) { return }
+    $before = $before.TrimEnd(',').Trim()
+
+    $sizeBefore = (Get-Item -LiteralPath $FilePath).Length
+    & $AtomicParsley "$FilePath" --title "" --overWrite 2>&1 | Out-Null
+
+    $still = @(& $FFprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 "$FilePath" 2>$null |
+               Select-String '^TAG:title=')
+    if ($still.Count -eq 0) {
+        $note = if ((Get-Item -LiteralPath $FilePath).Length -ne $sizeBefore) { " (file was rewritten)" } else { "" }
+        Write-Host "  Removed embedded title '$before'$note" -ForegroundColor Gray
+    }
+    else {
+        Write-Warning "  Could not remove embedded title '$before' from $FilePath"
+    }
+}
+
 function Write-SubtitleOutcome {
     param(
         [string]$SourcePath,
@@ -794,6 +838,10 @@ function Convert-MkvToMp4 {
                 # Write sidecar .srt alongside the output - the most reliable
                 # subtitle path in Plex (direct-plays on every client, never
                 # forces a transcode).
+                # Do this before the subtitle reporting so the console reads in
+                # the order the work happened.
+                if (-not $KeepEmbeddedTitle) { Remove-EmbeddedTitle -FilePath $OutputPath }
+
                 $sidecarResult = $null
                 if (-not $NoSidecar) {
                     $sidecarResult = Export-SidecarSubtitles -SourcePath $InputPath -VideoPath $OutputPath
