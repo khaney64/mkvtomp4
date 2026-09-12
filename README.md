@@ -6,8 +6,9 @@ A powerful PowerShell script for batch converting MKV video files to MP4 format 
 
 - 🎬 **Automatic Preset Selection** — Detects video resolution and applies appropriate HandBrake preset (480p or 1080p)
 - 📊 **Performance Tracking** — Learns from each conversion to provide accurate time estimates
-- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, show, and space modes for different workflows
+- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, show, space, and report modes for different workflows
 - 💾 **Disk Space Analysis** — Estimates required space and checks availability before conversion
+- 📄 **MP4 Report Generation** — Creates detailed reports of MP4 files organized by folder with resolution information
 - 🛡️ **Safe Conversion** — Uses temporary files to prevent incomplete MP4s from interrupted processes
 - 🎯 **Idempotent** — Running multiple times only converts new files
 - 🎨 **Color-Coded Output** — Easy-to-read progress and status messages
@@ -110,6 +111,40 @@ Analyzes disk space usage for all media files:
 .\Convert-MkvToMp4.ps1 space "M:\Movies"
 ```
 
+#### `report`
+Generates a detailed report of MP4 files with resolution information:
+- Scans each subfolder for MP4 files
+- Detects video resolution for each file (480p, 720p, 1080p, 2K, 4K, etc.)
+- Groups files by folder
+- Outputs results to `report.txt` in the current directory
+- Includes summary statistics
+
+```powershell
+.\Convert-MkvToMp4.ps1 -Mode report
+.\Convert-MkvToMp4.ps1 report "M:\Movies"
+```
+
+**Sample Report Output:**
+```
+================================================================================
+Folder: Avatar (2009)
+================================================================================
+  Avatar.mp4 - 1080p
+  Avatar - Extras.mp4 - 480p
+
+================================================================================
+Folder: The Matrix (1999)
+================================================================================
+  The Matrix.mp4 - 1080p
+
+================================================================================
+Summary
+================================================================================
+Total folders with MP4 files: 2
+Total MP4 files: 3
+Report generated: 2025-12-28 14:32:18
+```
+
 ## Conversion Settings
 
 The script uses the following HandBrake settings for high-quality, web-optimized output:
@@ -176,6 +211,17 @@ The script learns from each conversion:
 
 # Analyze a specific directory
 .\Convert-MkvToMp4.ps1 space "D:\Media\Movies"
+```
+
+### Generate a report of MP4 files
+```powershell
+# Create a report of all MP4 files with resolution information
+.\Convert-MkvToMp4.ps1 -Mode report
+
+# Generate report for a specific directory
+.\Convert-MkvToMp4.ps1 report "M:\Movies"
+
+# The report will be saved to report.txt in the scanned directory
 ```
 
 ## Output Examples
