@@ -5,11 +5,14 @@ A powerful PowerShell script for batch converting MKV video files to MP4 format 
 ## Features
 
 - 🎬 **Automatic Preset Selection** — Detects video resolution and applies appropriate HandBrake preset (480p or 1080p)
+- 💬 **Subtitle Preservation** — Carries the disc's subtitles into the MP4 and writes a sidecar `.srt`
+- 🔊 **Surround Audio Preservation** — Keeps the source 5.1 track and adds a stereo compatibility track
 - 📊 **Performance Tracking** — Learns from each conversion to provide accurate time estimates
-- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, show, space, and report modes for different workflows
+- 🔍 **Multiple Operation Modes** — Check, convert, find, hide, show, space, report, cleanup, and backfill
 - 💾 **Disk Space Analysis** — Estimates required space and checks availability before conversion
 - 📄 **MP4 Report Generation** — Creates detailed reports of MP4 files organized by folder with resolution information
 - 🛡️ **Safe Conversion** — Uses temporary files to prevent incomplete MP4s from interrupted processes
+- 🔒 **Subtitle-Loss Guard** — `cleanup` refuses to delete a source whose subtitles did not survive
 - 🎯 **Idempotent** — Running multiple times only converts new files
 - 🎨 **Color-Coded Output** — Easy-to-read progress and status messages
 
@@ -19,6 +22,13 @@ A powerful PowerShell script for batch converting MKV video files to MP4 format 
 - **HandBrakeCLI** — Download from [HandBrake.fr](https://handbrake.fr/downloads.php)
   - Default expected location: `C:\Tools\HandBrake\HandBrakeCLI.exe`
   - Update the `$HandBrakeCLI` variable in the script if installed elsewhere
+- **ffmpeg / ffprobe** — *optional but strongly recommended*
+  - Used to inspect audio and subtitle tracks, write sidecar `.srt` files, and
+    extract `.sup` subtitles
+  - Auto-discovered from `PATH`, `C:\Tools\ffmpeg\bin`, `C:\ffmpeg\bin`, or
+    `C:\Program Files\ffmpeg\bin`
+  - Without it the script still converts, but subtitle handling, best-audio-track
+    selection and the `backfill` mode are unavailable
 
 ## Installation
 
@@ -145,6 +155,41 @@ Total MP4 files: 3
 Report generated: 2025-12-28 14:32:18
 ```
 
+#### `cleanup`
+Deletes `.mk_` sources that have a confirmed-good `.mp4` replacement:
+- Requires the MP4 to be at least 50 MB and at least 8% of the source size
+- **Refuses to delete when the source's subtitles did not survive** — see
+  [Safety Features](#safety-features)
+- Reports every case it declines to touch, and why
+
+```powershell
+.\Convert-MkvToMp4.ps1 -Mode cleanup
+.\Convert-MkvToMp4.ps1 cleanup "M:\Movies" -SkipSubtitleGuard   # override
+```
+
+#### `backfill`
+Writes sidecar `.srt` files for videos converted before subtitle handling existed:
+- Pairs each video with its surviving `.mkv`/`.mk_` and extracts any text subtitle track
+- Works on a source with no paired MP4, and on an MP4 with an embedded text track
+- Skips titles that already have a sidecar, or that already carry embedded text
+  (`-IncludeEmbedded` to write one anyway)
+- Reports bitmap-only sources, which need OCR or a download instead
+
+```powershell
+.\Convert-MkvToMp4.ps1 -Mode backfill
+.\Convert-MkvToMp4.ps1 backfill "M:\Movies"
+```
+
+### Switches
+
+| Switch | Effect |
+|---|---|
+| `-Container mkv` | Output MKV instead of MP4. Keeps bitmap (PGS/VobSub) subtitles as selectable tracks — same file size, since the saving comes from the re-encode, not the container |
+| `-NoSidecar` | Do not write sidecar `.srt` files during convert/backfill |
+| `-NoSup` | Do not extract `.sup` archives for subtitles MP4 cannot carry |
+| `-IncludeEmbedded` | During `backfill`, write a sidecar even if the video already has an embedded text track |
+| `-SkipSubtitleGuard` | Allow `cleanup` to delete sources whose subtitles were lost |
+
 ## Conversion Settings
 
 The script uses the following HandBrake settings for high-quality, web-optimized output:
@@ -154,8 +199,58 @@ The script uses the following HandBrake settings for high-quality, web-optimized
 - **Preset**: Automatically selected based on resolution
   - SD (≤480p): `Fast 480p30`
   - HD (≥720p): `Fast 1080p30`
-- **Audio**: AC3 passthrough with AAC fallback
 - **Optimization**: Web-optimized (fast-start enabled)
+
+### Audio
+
+Two tracks are written: the source's **best** audio track, plus an AAC stereo
+compatibility track.
+
+- The best track is chosen by **channel count**, not position — disc track order
+  is inconsistent, and some titles list the stereo mix before the 5.1 one
+- AC3 / E-AC3 sources are **passed through untouched** (bit-identical)
+- Anything that cannot pass through (DTS, TrueHD, LPCM) is encoded to **AC3**,
+  which keeps all channels and plays natively everywhere — including over
+  S/PDIF, which cannot carry multichannel AAC
+- The AC3 bitrate scales with channel count: 192k mono, 256k stereo, 640k for
+  5.1 and above
+
+### Subtitles
+
+English subtitles are selected explicitly and none are burned in. What actually
+survives depends on the format, which in turn depends on the disc:
+
+| Source format | Comes from | Into the MP4? |
+|---|---|---|
+| `subrip` (text) | DVD closed captions, extracted by MakeMKV | Yes, as `mov_text` — **and** as a sidecar `.srt` |
+| `dvd_subtitle` (VobSub) | DVD | Yes (non-standard, but Plex reads it) |
+| `hdmv_pgs_subtitle` (PGS) | Blu-ray | **No** — nothing can put PGS in an MP4 |
+| `dvb_subtitle` | Broadcast | **No** |
+
+**Blu-rays do not carry closed captions**, so a Blu-ray rip yields bitmap
+subtitles only and produces no `.srt`. That is expected, not a failure. DVDs
+usually do carry captions, which is why DVD rips get a sidecar automatically.
+
+When a format cannot be carried, the script says so plainly rather than leaving
+you to discover it in Plex later:
+
+```
+  Subtitles: source 1 track(s) [hdmv_pgs_subtitle] -> output 0 track(s)
+             1 hdmv_pgs_subtitle track(s) could NOT be written to MP4 ...
+             saved film.en.sup (15.7 MB) - OCR it later with Subtitle Edit
+             *** RESULT: no subtitles in the output. ***
+```
+
+It also **extracts those tracks to a `.sup` sidecar automatically**, because
+otherwise their only copy is inside the `.mkv` you are about to delete. The cost
+is roughly 0.2% of the source size. A `.sup` is an archive, not a playable
+subtitle — Plex ignores it — but it can be OCR'd to `.srt` with
+[Subtitle Edit](https://www.nikse.dk/subtitleedit) at any time.
+
+Sidecars are matched by **exact basename**, so `Film_t00.mp4` needs
+`Film_t00.en.srt`. Watch for this when moving a converted file into a folder
+where an older version already lives: an overwrite keeps the old name and
+strands the subtitle.
 
 ## Performance Tracking
 
@@ -274,6 +369,12 @@ To proceed with conversion, run:
 - **Idempotent**: Safe to run multiple times—skips existing MP4 files
 - **No Overwrites**: Never overwrites existing MP4 files
 - **Validation**: Checks for HandBrakeCLI and valid paths before processing
+- **Subtitle-Loss Guard**: `cleanup` will not delete a `.mk_` source whose
+  subtitles are absent from the replacement — a size check alone cannot tell
+  that a conversion silently dropped them, and the source is the only remaining
+  copy. Override with `-SkipSubtitleGuard`.
+- **Bitmap Subtitle Archive**: PGS/DVB tracks are extracted to `.sup` before they
+  can be lost with the source. Disable with `-NoSup`.
 
 ## Troubleshooting
 
@@ -299,9 +400,29 @@ Warning: HandBrake returned exit code 1 for: Movie.mkv
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
 
+### No subtitles in the output
+
+```
+  *** RESULT: no subtitles in the output. ***
+```
+**Cause**: the source is bitmap-only (typical of Blu-ray, which carries no closed
+captions), so there was no text track to carry across or write as a sidecar.
+
+**Solutions**: OCR the `.sup` the script saved alongside the MP4 with
+[Subtitle Edit](https://www.nikse.dk/subtitleedit), download a subtitle, or
+re-run with `-Container mkv` to keep the bitmap track as a selectable stream.
+
+### Converted file only has stereo
+
+Check that ffprobe is available — without it the script cannot inspect the
+source and falls back to audio track 1, which is not always the best one. Run a
+conversion and confirm the line `Using source audio track N (Mch)` reports the
+channel count you expect.
+
 ## Documentation
 
-See [copilot-instructions.md](copilot-instructions.md) for complete technical documentation and regeneration instructions.
+- [SPEC.md](SPEC.md) — complete technical specification and regeneration instructions
+- [AGENTS.md](AGENTS.md) — conventions for AI agents and contributors working on this repo
 
 ## License
 
