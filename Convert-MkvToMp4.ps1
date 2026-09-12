@@ -563,7 +563,11 @@ function Export-BitmapSubtitles {
         $n++
         $suffix = if ($n -eq 1) { 'en' } else { "en.$n" }
         if ($s.Forced) { $suffix = "en.forced" }
-        $dest = Join-Path $baseDir "$baseName.$suffix.sup"
+        # ".sup.bak", not ".sup": Plex DOES read .sup sidecars and offers them as
+        # a subtitle track. Selecting one forces a burn-in transcode, which this
+        # NAS cannot do comfortably. The extra suffix keeps the archive beside the
+        # film while hiding it from the scanner. Rename to .sup to OCR it.
+        $dest = Join-Path $baseDir "$baseName.$suffix.sup.bak"
         if (Test-Path $dest) { $written += $dest; continue }
 
         & $FFmpeg -nostdin -v error -y -i "$SourcePath" -map "0:$($s.Index)" -c:s copy "$dest" 2>$null
