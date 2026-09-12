@@ -11,7 +11,7 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 1. **Mode** (Position 0, Optional)
    - Type: String
    - Default: `"check"`
-   - Valid values: `"check"`, `"convert"`, `"find"`, `"hide"`, `"show"`, `"space"`
+   - Valid values: `"check"`, `"convert"`, `"find"`, `"hide"`, `"show"`, `"space"`, `"report"`
    - Description: Determines the operation to perform
 
 2. **Path** (Position 1, Optional)
@@ -59,7 +59,16 @@ Create a PowerShell script that automates the conversion of MKV video files to M
      - `TotalConversions`: Integer (number of successful conversions tracked)
      - `LastUpdated`: String (ISO 8601 timestamp)
 
-4. **HandBrake Log Files** (Temporary)
+4. **Report File** (`report.txt`)
+   - Format: Plain text
+   - Created by: Report mode
+   - Content:
+     - Folder names grouped by directory
+     - MP4 files within each folder
+     - Video resolution information (480p, 720p, 1080p, 2K, 4K, etc.)
+     - Summary statistics (total folders, total MP4 files, generation timestamp)
+
+5. **HandBrake Log Files** (Temporary)
    - `%TEMP%\handbrake_out.log`: Standard output
    - `%TEMP%\handbrake_err.log`: Standard error
    - Purpose: Suppress verbose console output
@@ -130,6 +139,41 @@ Create a PowerShell script that automates the conversion of MKV video files to M
      - Available space in GB
      - Usage percentage
 6. Exit with code 0
+
+#### Mode: "report"
+
+1. Initialize report variables:
+   - `$reportPath = Join-Path $currentDir "report.txt"`
+   - `$reportLines = @()` (array for report content)
+   - Initialize counters: `$totalFolders`, `$totalMp4Files`
+2. Get all subdirectories in current directory using `Get-ChildItem -Directory | Sort-Object Name`
+3. For each folder:
+   - Find all MP4 files in the folder (non-recursive, immediate children only)
+   - If MP4 files exist:
+     - Increment `$totalFolders`
+     - Add folder header to report with separator line (80 equals signs)
+     - Display progress message (folder name)
+     - For each MP4 file:
+       - Display progress message (analyzing file)
+       - Call `Get-VideoHeight` to detect resolution
+       - Call `Get-VideoFormatLabel` to convert height to format string
+       - Add to report: "  {filename} - {format}" (e.g., "movie.mp4 - 1080p")
+       - If height detection fails, add "(Unable to detect resolution)"
+       - Increment `$totalMp4Files`
+4. Add summary section to report:
+   - Blank line separator
+   - Header with 80 equals signs
+   - "Summary" heading
+   - Header with 80 equals signs
+   - Total folders with MP4 files count
+   - Total MP4 files count
+   - Generation timestamp (formatted as 'yyyy-MM-dd HH:mm:ss')
+5. Write report lines to file using `Out-File` with UTF8 encoding
+6. Display completion summary:
+   - Folders scanned count
+   - MP4 files found count
+   - Report file path
+7. Exit with code 0
 
 #### Mode: "find"
 
@@ -204,7 +248,7 @@ Create a PowerShell script that automates the conversion of MKV video files to M
 
 #### Get-VideoHeight
 
-**Purpose**: Detect video resolution height from MKV file
+**Purpose**: Detect video resolution height from MKV or MP4 file
 
 **Process**:
 1. Execute `HandBrakeCLI --scan --input "$FilePath"` and capture output (stderr + stdout)
@@ -213,6 +257,24 @@ Create a PowerShell script that automates the conversion of MKV video files to M
    - Fallback: `(\d+)x(\d+)` → extract second group (height)
 3. Return height as integer, or `$null` if not found
 4. Log warnings on failures
+
+**Note**: Works with both MKV and MP4 files for report mode.
+
+#### Get-VideoFormatLabel
+
+**Purpose**: Convert video height to user-friendly format label
+
+**Parameters**:
+- `Height`: Integer (video resolution height in pixels)
+
+**Logic**:
+- If height ≤ 480: return `"480p"`
+- If height ≤ 576: return `"576p"`
+- If height ≤ 720: return `"720p"`
+- If height ≤ 1080: return `"1080p"`
+- If height ≤ 1440: return `"1440p (2K)"`
+- If height ≤ 2160: return `"2160p (4K)"`
+- Else: return `"{height}p"` (e.g., "4320p" for 8K)
 
 #### Get-HandBrakePreset
 
