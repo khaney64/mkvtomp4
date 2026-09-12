@@ -5,5 +5,6 @@
 !/.gitignore
 !/Convert-MkvToMp4.ps1
 !/README.md
-!/copilot-instructions.md
+!/SPEC.md
 !/Compare-RecycleBin.ps1
+!/AGENTS.md

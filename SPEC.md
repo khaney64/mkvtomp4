@@ -1,5 +1,15 @@
 # MKV to MP4 Batch Converter Script - Complete Requirements
 
+> **Status: partial.** This document specifies the script as it stood through the
+> `report`/`cleanup` modes. It does **not** yet cover the subtitle and audio work
+> added afterwards, summarised under
+> [Subtitle and Audio Requirements](#subtitle-and-audio-requirements) below.
+>
+> **Do not regenerate the script from the older sections alone.** Doing so would
+> reintroduce fixed defects: no subtitles written, 5.1 downmixed to stereo, and
+> an unguarded `cleanup` that deletes sources whose subtitles were lost. See
+> `README.md` and `git log` for current behaviour.
+
 ## Purpose
 
 Create a PowerShell script that automates the conversion of MKV video files to MP4 format using HandBrakeCLI. The script must intelligently select encoding presets based on video resolution, track performance metrics to improve time estimates, and provide multiple operation modes for different use cases including conversion, analysis, and file management.
@@ -609,3 +619,54 @@ Ensure:
 10. **Exit codes**: Use `exit 0` for success, `exit 1` for errors
 
 This document provides complete instructions to regenerate the PowerShell script without reference to existing code. All logic, formulas, constants, and design decisions are documented explicitly.
+
+---
+
+## Subtitle and Audio Requirements
+
+Added after the sections above. These are requirements, not history - a
+regenerated script must satisfy them.
+
+### Audio selection
+
+1. Choose the source audio track with the **most channels**, breaking ties toward
+   a codec MP4 can pass through (`ac3`, `eac3`). Do **not** assume track 1: disc
+   track order varies and some titles list stereo before 5.1.
+2. Emit two output tracks from that source track: the original (passed through
+   where possible) and an AAC stereo compatibility track.
+3. Where passthrough is impossible (DTS, TrueHD, LPCM), encode to **AC3**, not
+   AAC. Multichannel AAC cannot be bitstreamed over S/PDIF.
+4. Scale the AC3 bitrate by channel count: 192k for 1 channel, 256k for 2,
+   640k for 6 or more (640k is AC3's ceiling).
+
+### Subtitle handling
+
+1. Select English subtitle tracks explicitly (`--subtitle-lang-list eng`,
+   `--all-subtitles`) and burn none in. HandBrake's preset default is
+   "Foreign Audio Search", which passes nothing through.
+2. Write a sidecar `.srt` for any text subtitle track in the source.
+3. Extract PGS/DVB tracks to a `.sup` beside the **output**, since MP4 cannot
+   carry them and the source is usually deleted afterwards.
+4. After each conversion, report source track count vs output track count, and
+   state plainly when the result has no subtitles at all.
+
+### Modes
+
+- `backfill` - write sidecar `.srt` files for previously converted videos, from a
+  surviving `.mkv`/`.mk_` or from an embedded text track. Must work when there is
+  no paired MP4. Skip titles that already have a sidecar or embedded text unless
+  overridden.
+- `cleanup` - must **refuse** to delete a source whose subtitles are absent from
+  the replacement, unless explicitly overridden. A size check cannot detect a
+  conversion that silently dropped them, and the source is the last copy.
+
+### Switches
+
+`-Container mp4|mkv`, `-NoSidecar`, `-NoSup`, `-IncludeEmbedded`,
+`-SkipSubtitleGuard`.
+
+### External dependencies
+
+ffmpeg and ffprobe, auto-discovered. The script must degrade gracefully when
+they are absent: conversion still works, subtitle handling and best-track
+selection do not.
