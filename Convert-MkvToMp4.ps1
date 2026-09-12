@@ -482,15 +482,29 @@ function Get-SourceForVideo {
 # consistent - some titles list the stereo mix before the 5.1 one. Find the
 # richest track instead of assuming position 1.
 # Returns a 1-based index among the source's audio streams.
+# AC3 needs far less bitrate for fewer channels; 640k is the 5.1 figure and is
+# wasteful on a mono track. (640k is also AC3's ceiling.)
+function Get-Ac3Bitrate {
+    param([int]$Channels)
+    switch ($Channels) {
+        { $_ -ge 6 } { return 640 }
+        { $_ -eq 2 } { return 256 }
+        { $_ -le 1 } { return 192 }
+        default      { return 448 }
+    }
+}
+
+# Returns an object: Index (1-based among audio streams) and Channels.
 function Get-BestAudioTrack {
     param([string]$FilePath)
 
-    if (-not $SubtitleToolsAvailable) { return 1 }
+    $fallback = [PSCustomObject]@{ Index = 1; Channels = 2 }
+    if (-not $SubtitleToolsAvailable) { return $fallback }
 
     try {
         $lines = @(& $FFprobe -v error -select_streams a `
                     -show_entries stream=codec_name,channels -of csv=p=0 "$FilePath" 2>$null)
-        if ($lines.Count -eq 0) { return 1 }
+        if ($lines.Count -eq 0) { return $fallback }
 
         $i = 0; $best = 1; $bestCh = -1; $bestRank = 9
         foreach ($line in $lines) {
@@ -508,11 +522,64 @@ function Get-BestAudioTrack {
                 $best = $i; $bestCh = $ch; $bestRank = $rank
             }
         }
-        return $best
+        return [PSCustomObject]@{ Index = $best; Channels = [Math]::Max($bestCh, 1) }
     }
     catch {
         Write-Verbose "Could not determine best audio track for ${FilePath}: $_"
-        return 1
+        return $fallback
+    }
+}
+
+# Reports what happened to the source's subtitles, so a title that ends up with
+# none is obvious at conversion time rather than discovered later in Plex.
+function Write-SubtitleOutcome {
+    param(
+        [string]$SourcePath,
+        [string]$OutputPath,
+        [string]$SidecarPath
+    )
+
+    if (-not $SubtitleToolsAvailable) { return }
+
+    $srcSubs = Get-SubtitleStreams -FilePath $SourcePath
+    $outSubs = Get-SubtitleStreams -FilePath $OutputPath
+    $haveSidecar = $SidecarPath -and (Test-Path $SidecarPath)
+
+    if ($srcSubs.Count -eq 0) {
+        Write-Host "  Subtitles: source has none." -ForegroundColor Yellow
+        Write-Host "             -> download one (subliminal / Bazarr) if you want subtitles." -ForegroundColor Yellow
+        return
+    }
+
+    # Formats MP4 refuses. VobSub does mux (non-standard but readable);
+    # PGS and DVB do not.
+    $blockedCodecs = @('hdmv_pgs_subtitle', 'dvb_subtitle', 'dvb_teletext')
+    $blocked = @($srcSubs | Where-Object { $blockedCodecs -contains $_.Codec })
+    $dropped = @($srcSubs | Where-Object { $_.Language -notin @('eng', 'en', 'und', '') })
+
+    Write-Host ("  Subtitles: source {0} track(s) [{1}] -> output {2} track(s){3}" -f
+        $srcSubs.Count,
+        (($srcSubs.Codec | Sort-Object -Unique) -join ', '),
+        $outSubs.Count,
+        $(if ($haveSidecar) { ", sidecar written" } else { "" })) -ForegroundColor Gray
+
+    if ($blocked.Count -gt 0 -and $Container -eq "mp4") {
+        Write-Host ("             {0} {1} track(s) could NOT be written to MP4 (the container does not support them)." -f
+            $blocked.Count, (($blocked.Codec | Sort-Object -Unique) -join '/')) -ForegroundColor Yellow
+    }
+    if ($dropped.Count -gt 0) {
+        Write-Host ("             {0} non-English track(s) skipped." -f $dropped.Count) -ForegroundColor DarkGray
+    }
+
+    if ($outSubs.Count -eq 0 -and -not $haveSidecar) {
+        Write-Host "             *** RESULT: no subtitles in the output. ***" -ForegroundColor Red
+        if ($blocked.Count -gt 0) {
+            Write-Host "             Bitmap-only source (typical of Blu-ray). Options: download a" -ForegroundColor Red
+            Write-Host "             subtitle, OCR the source with Subtitle Edit, or use -Container mkv." -ForegroundColor Red
+        }
+        else {
+            Write-Host "             Download a subtitle for this title." -ForegroundColor Red
+        }
     }
 }
 
@@ -558,8 +625,11 @@ function Convert-MkvToMp4 {
         # nothing through unless forced subs are detected. Select every English
         # track explicitly and burn none of them in.
         $copyMask = if ($Container -eq "mkv") { "ac3,eac3,dts,dtshd,truehd" } else { "ac3,eac3" }
-        $audioTrack = Get-BestAudioTrack -FilePath $InputPath
-        Write-Host "Using source audio track: $audioTrack" -ForegroundColor Gray
+        $audioInfo   = Get-BestAudioTrack -FilePath $InputPath
+        $audioTrack  = $audioInfo.Index
+        $surroundKbps = Get-Ac3Bitrate -Channels $audioInfo.Channels
+        Write-Host ("Using source audio track {0} ({1}ch); AC3 fallback bitrate {2}k" -f
+            $audioTrack, $audioInfo.Channels, $surroundKbps) -ForegroundColor Gray
 
         $arguments = @(
             "--preset", "`"$Preset`"",
@@ -572,7 +642,7 @@ function Convert-MkvToMp4 {
             "--aname", "`"Surround,Stereo`"",
             "--audio-copy-mask", $copyMask,
             "--audio-fallback", "ac3",
-            "-B", "640,160",
+            "-B", "$surroundKbps,160",
             "--subtitle-lang-list", "eng",
             "--all-subtitles",
             "--subtitle-burned=none",
@@ -609,9 +679,12 @@ function Convert-MkvToMp4 {
                 # Write sidecar .srt alongside the output - the most reliable
                 # subtitle path in Plex (direct-plays on every client, never
                 # forces a transcode).
+                $sidecarResult = $null
                 if (-not $NoSidecar) {
-                    $null = Export-SidecarSubtitles -SourcePath $InputPath -VideoPath $OutputPath
+                    $sidecarResult = Export-SidecarSubtitles -SourcePath $InputPath -VideoPath $OutputPath
                 }
+                $sidecarPath = if ($sidecarResult -and $sidecarResult.Written.Count -gt 0) { $sidecarResult.Written[0] } else { $null }
+                Write-SubtitleOutcome -SourcePath $InputPath -OutputPath $OutputPath -SidecarPath $sidecarPath
 
                 # Update performance metrics
                 Update-PerformanceMetrics -SourceSizeBytes $sourceSize -ConversionTimeMinutes $elapsedMinutes
