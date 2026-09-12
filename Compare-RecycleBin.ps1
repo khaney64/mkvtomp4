@@ -7,21 +7,69 @@
     Reports any files that exist in #recycle but NOT in the active folders.
     This helps ensure you don't permanently delete files that aren't duplicates.
 
+.PARAMETER MediaRoot
+    Root of the media share. Defaults to \\localcloud\media.
+
+.PARAMETER RecycleRoot
+    Location of the recycle bin. Defaults to the #recycle folder inside
+    MediaRoot, which is where Synology puts it.
+
+.PARAMETER Folders
+    Library folders to compare. Defaults to Movies and TV Shows.
+
 .NOTES
     Created: December 9, 2025
     Purpose: Safety check before emptying Synology #recycle bin
+
+.EXAMPLE
+    .\Compare-RecycleBin.ps1
+
+.EXAMPLE
+    .\Compare-RecycleBin.ps1 -MediaRoot '\\nas\media' -Folders 'Movies','Music'
+
+.EXAMPLE
+    # recycle bin somewhere other than inside the share
+    .\Compare-RecycleBin.ps1 -MediaRoot 'D:\Media' -RecycleRoot 'E:\Trash'
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [string]$MediaRoot = '\\localcloud\media',
+    [string]$RecycleRoot,
+    [string[]]$Folders = @('Movies', 'TV Shows'),
 
-$mediaRoot = "\\localcloud\media"
-$recycleRoot = "\\localcloud\media\#recycle"
+    # Path segments to ignore. A git repo living inside the library churns
+    # hundreds of transient .git lock files, and Synology captures every one of
+    # them in #recycle - they would otherwise swamp the real findings.
+    # NOTE: do not add '#recycle' here - the recycle path itself contains that
+    # segment, so it would filter out every file being checked and wrongly
+    # report the bin as safe to empty.
+    [string[]]$ExcludeFolders = @('.git', '@eaDir')
+)
+
+$mediaRoot = $MediaRoot.TrimEnd('\')
+# Synology keeps the bin inside the share; allow it to sit elsewhere.
+$recycleRoot = if ($RecycleRoot) { $RecycleRoot.TrimEnd('\') } else { Join-Path $mediaRoot '#recycle' }
+
+if (-not (Test-Path -LiteralPath $mediaRoot)) { throw "MediaRoot not found: $mediaRoot" }
+if (-not (Test-Path -LiteralPath $recycleRoot)) {
+    Write-Host "No recycle bin at $recycleRoot - nothing to check." -ForegroundColor Green
+    return
+}
 
 Write-Host "==========================================" -ForegroundColor Yellow
 Write-Host "Recycle Bin Safety Check" -ForegroundColor Yellow
 Write-Host "==========================================" -ForegroundColor Yellow
 Write-Host ""
+
+# True when any path segment matches one of -ExcludeFolders.
+function Test-Excluded {
+    param([string]$FullPath)
+    foreach ($seg in ($FullPath -split '[\\/]')) {
+        if ($ExcludeFolders -contains $seg) { return $true }
+    }
+    return $false
+}
 
 # Function to get relative path from base
 function Get-RelativePath {
@@ -55,7 +103,8 @@ function Compare-Folders {
     
     # Get all files from active folder
     Write-Host "Scanning active $FolderName folder..." -ForegroundColor Gray
-    $activeFiles = Get-ChildItem -Path $ActivePath -Recurse -File -ErrorAction SilentlyContinue
+    $activeFiles = Get-ChildItem -Path $ActivePath -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { -not (Test-Excluded $_.FullName) }
     $activeFileSet = @{}
     foreach ($file in $activeFiles) {
         $relativePath = Get-RelativePath -FullPath $file.FullName -BasePath $ActivePath
@@ -65,7 +114,8 @@ function Compare-Folders {
     
     # Get all files from recycle folder
     Write-Host "Scanning recycle $FolderName folder..." -ForegroundColor Gray
-    $recycleFiles = Get-ChildItem -Path $RecyclePath -Recurse -File -ErrorAction SilentlyContinue
+    $recycleFiles = @(Get-ChildItem -Path $RecyclePath -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object { -not (Test-Excluded $_.FullName) })
     Write-Host "  Found $($recycleFiles.Count) files in recycle folder" -ForegroundColor Gray
     Write-Host ""
     
@@ -165,17 +215,13 @@ function Compare-Folders {
     }
 }
 
-# Compare Movies folder
-$moviesResults = Compare-Folders `
-    -ActivePath "$mediaRoot\Movies" `
-    -RecyclePath "$recycleRoot\Movies" `
-    -FolderName "Movies"
-
-# Compare TV Shows folder
-$tvShowsResults = Compare-Folders `
-    -ActivePath "$mediaRoot\TV Shows" `
-    -RecyclePath "$recycleRoot\TV Shows" `
-    -FolderName "TV Shows"
+# Compare each requested library folder
+$allResults = foreach ($folder in $Folders) {
+    Compare-Folders `
+        -ActivePath (Join-Path $mediaRoot $folder) `
+        -RecyclePath (Join-Path $recycleRoot $folder) `
+        -FolderName $folder
+}
 
 # Final summary
 Write-Host "==========================================" -ForegroundColor Yellow
@@ -186,15 +232,11 @@ $totalUnique = 0
 $totalMismatches = 0
 $totalExactDuplicates = 0
 
-if ($moviesResults) { 
-    $totalUnique += $moviesResults.UniqueToRecycle.Count
-    $totalMismatches += $moviesResults.SizeMismatches.Count
-    $totalExactDuplicates += $moviesResults.ExactDuplicates
-}
-if ($tvShowsResults) { 
-    $totalUnique += $tvShowsResults.UniqueToRecycle.Count
-    $totalMismatches += $tvShowsResults.SizeMismatches.Count
-    $totalExactDuplicates += $tvShowsResults.ExactDuplicates
+foreach ($r in $allResults) {
+    if (-not $r) { continue }
+    $totalUnique += $r.UniqueToRecycle.Count
+    $totalMismatches += $r.SizeMismatches.Count
+    $totalExactDuplicates += $r.ExactDuplicates
 }
 
 Write-Host "Total exact duplicates: $totalExactDuplicates" -ForegroundColor Green
