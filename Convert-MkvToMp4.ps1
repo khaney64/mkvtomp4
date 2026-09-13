@@ -588,15 +588,20 @@ function Export-BitmapSubtitles {
         $dest = Join-Path $baseDir "$baseName.$suffix.sup.bak"
         if (Test-Path $dest) { $written += $dest; continue }
 
-        & $FFmpeg -nostdin -v error -y -i "$SourcePath" -map "0:$($s.Index)" -c:s copy "$dest" 2>$null
+        # -f sup is REQUIRED: ffmpeg picks its muxer from the file extension, and
+        # the ".bak" suffix means nothing to it ("Unable to choose an output
+        # format"). Without this the extraction fails silently.
+        $ffErr = & $FFmpeg -nostdin -v error -y -i "$SourcePath" -map "0:$($s.Index)" -c:s copy -f sup "$dest" 2>&1
 
         if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0) {
             $written += $dest
             Write-Host ("             saved {0} ({1:N1} MB) - OCR it later with Subtitle Edit" -f
                         [IO.Path]::GetFileName($dest), ((Get-Item $dest).Length / 1MB)) -ForegroundColor Cyan
         }
-        elseif (Test-Path $dest) {
-            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        else {
+            if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
+            Write-Warning ("Could not extract subtitle track {0} to {1}: {2}" -f
+                           $s.Index, [IO.Path]::GetFileName($dest), ($ffErr -join ' '))
         }
     }
     return $written
