@@ -61,7 +61,12 @@ param(
 
     # Keep the embedded title tag HandBrake copies from the source disc.
     [Parameter()]
-    [switch]$KeepEmbeddedTitle
+    [switch]$KeepEmbeddedTitle,
+
+    # Run HandBrake at normal priority. By default it runs at low priority with
+    # EcoQoS so it does not make the desktop unusable.
+    [Parameter()]
+    [switch]$NormalPriority
 )
 
 # Configuration
@@ -605,6 +610,46 @@ function Export-BitmapSubtitles {
 # This is cheap: MP4 metadata lives in the small `moov` atom, not the multi-GB
 # `mdat` payload, and deleting a tag frees space rather than needing more, so
 # AtomicParsley patches it in place without touching the media (~83ms on 271MB).
+# Puts a running process into "Efficiency mode" - the same thing the Task
+# Manager right-click option does. Low scheduler priority plus EcoQoS power
+# throttling, which on hybrid CPUs parks the work on the efficiency cores.
+function Set-ProcessEfficiencyMode {
+    param([System.Diagnostics.Process]$Process)
+
+    try { $Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Idle }
+    catch { Write-Verbose "Could not lower priority: $_" }
+
+    # EcoQoS via SetProcessInformation. Windows 11+; harmless failure elsewhere.
+    if (-not ([System.Management.Automation.PSTypeName]'Win32EcoQos').Type) {
+        try {
+            Add-Type -Namespace '' -Name 'Win32EcoQos' -MemberDefinition @"
+[StructLayout(LayoutKind.Sequential)]
+public struct PROCESS_POWER_THROTTLING_STATE {
+    public uint Version;
+    public uint ControlMask;
+    public uint StateMask;
+}
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetProcessInformation(
+    IntPtr hProcess, int ProcessInformationClass,
+    ref PROCESS_POWER_THROTTLING_STATE ProcessInformation, int ProcessInformationSize);
+"@ -ErrorAction Stop
+        }
+        catch { Write-Verbose "EcoQoS interop unavailable: $_"; return }
+    }
+
+    try {
+        $state = New-Object Win32EcoQos+PROCESS_POWER_THROTTLING_STATE
+        $state.Version = 1                    # PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        $state.ControlMask = 1                # PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        $state.StateMask = 1                  # enable throttling
+        $size = [System.Runtime.InteropServices.Marshal]::SizeOf($state)
+        # 4 = ProcessPowerThrottling
+        [Win32EcoQos]::SetProcessInformation($Process.Handle, 4, [ref]$state, $size) | Out-Null
+    }
+    catch { Write-Verbose "Could not set EcoQoS: $_" }
+}
+
 function Remove-EmbeddedTitle {
     param([string]$FilePath)
 
@@ -821,11 +866,16 @@ function Convert-MkvToMp4 {
         $process = Start-Process -FilePath $HandBrakeCLI `
                                  -ArgumentList $arguments `
                                  -NoNewWindow `
-                                 -Wait `
                                  -PassThru `
                                  -RedirectStandardOutput "$env:TEMP\handbrake_out.log" `
                                  -RedirectStandardError "$env:TEMP\handbrake_err.log"
         
+        if (-not $NormalPriority) {
+            Set-ProcessEfficiencyMode -Process $process
+            Write-Host "  HandBrake running in efficiency mode (low priority + EcoQoS)" -ForegroundColor Gray
+        }
+        $process.WaitForExit()
+
         # Calculate elapsed time
         $endTime = Get-Date
         $elapsedMinutes = ($endTime - $startTime).TotalMinutes
